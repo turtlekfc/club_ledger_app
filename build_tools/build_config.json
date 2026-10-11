@@ -1,0 +1,22 @@
+{
+  "_說明": {
+    "app_name": "程式名稱 (輸出檔名)",
+    "main_file": "主程式 (需位於專案最上層)",
+    "windowed": "auto = 偵測到 GUI 套件就隱藏主控台視窗；true / false 可強制指定",
+    "onefile": "false = 輸出資料夾 (啟動較快)；true = 單一執行檔",
+    "obfuscate": "true = 以 PyArmor 加密原始碼",
+    "data": "auto = 自動偵測要一起打包的資料夾/檔案；或填清單，例如 [\"frontend\", \"config.json\"]",
+    "hidden_imports": "偵測不到、但執行時需要的模組，例如 [\"babel.numbers\"]",
+    "excludes": "不要打包的模組，例如 [\"matplotlib\"]",
+    "icon": "true = 使用 build_tools/app_icon.ico (Windows) 與 app_icon.png (macOS)"
+  },
+  "app_name": "club_ledger_app",
+  "main_file": "main.py",
+  "windowed": "auto",
+  "onefile": false,
+  "obfuscate": true,
+  "data": "auto",
+  "hidden_imports": [],
+  "excludes": [],
+  "icon": true
+}

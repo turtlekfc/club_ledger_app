@@ -1,0 +1,11 @@
+# added by build_app.bat
+dist/
+build/
+pyarmor_dist/
+*.spec
+__pycache__/
+.env
+*.log
+*.db
+*.sqlite
+*.sqlite3
