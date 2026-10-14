@@ -1,8 +1,0 @@
-pywebview>=6.0
-pyinstaller>=6.0
-
-# pywebview 在 macOS 上是用內建的 Cocoa/WebKit 當瀏覽引擎（不是另外裝瀏覽器），
-# 需要這兩個 pyobjc 套件才能運作；只在 macOS 上安裝，Windows/Linux 不需要、
-# 也裝不了（pyobjc 是 macOS 專屬的 Python-Objective-C 橋接套件）。
-pyobjc-framework-Cocoa; sys_platform == "darwin"
-pyobjc-framework-WebKit; sys_platform == "darwin"
