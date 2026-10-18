@@ -1,0 +1,17 @@
+# added by build_app.bat
+/dist/
+/build/
+/pyarmor_dist/
+*.spec
+__pycache__/
+.env
+*.log
+*.db
+*.sqlite
+*.sqlite3
+# added by build_app.bat
+/dist_obf/
+/venv/
+/.venv/
+/env/
+/venv_損壞備份_5907/
