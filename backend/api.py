@@ -530,6 +530,38 @@ class Api:
             return counts
         return {}
 
+    def _load_valid_mobile_category_names(self):
+        """回傳目前帳本「帳目分類」清單裡所有分類名稱（收入+支出合併）。
+        讀不到/格式不對時回傳 None，代表「不檢查」，不要因為這裡解析失敗
+        就連帶讓所有手機匯入的類別都被誤判成不合法。"""
+        try:
+            raw = self._db.get("categories")
+            if not raw:
+                return None
+            data = json.loads(raw)
+            names = set()
+            for kind in ("income", "expense"):
+                for c in data.get(kind) or []:
+                    if isinstance(c, dict) and c.get("name"):
+                        names.add(str(c["name"]))
+            return names
+        except Exception:
+            log.warning("_load_valid_mobile_category_names failed", exc_info=True)
+            return None
+
+    def _load_valid_mobile_handler_names(self):
+        """回傳目前帳本「經手人」清單裡所有名字。讀不到/格式不對時回傳
+        None（不檢查），理由同上。"""
+        try:
+            raw = self._db.get("handlers")
+            if not raw:
+                return None
+            data = json.loads(raw)
+            return {str(h["name"]) for h in data if isinstance(h, dict) and h.get("name")}
+        except Exception:
+            log.warning("_load_valid_mobile_handler_names failed", exc_info=True)
+            return None
+
     def fetch_pending_mobile_entries(self, sheet_id: str, sheet_name: str):
         """讀取雲端暫存表裡「尚未匯入」的列，解析成交易草稿讓前端預覽，
         但完全不會寫入任何東西（本機或雲端皆不會），可以放心重複呼叫。
@@ -556,6 +588,14 @@ class Api:
         data_rows = rows[1:] if len(rows) > 1 else []  # 第0列是表單產生的標題列
         imported_counts = self._load_mobile_import_counts(data_rows)
         seen_counts = {}
+
+        # 類別／經手人這兩個欄位在「新增/編輯帳目」畫面都是下拉選單，選項只來自
+        # 管理中心目前的清單；手機表單是自由輸入文字，如果填的名字不在清單裡，
+        # 這裡先擋下來（跟日期/金額/收支類型一樣，整列視為格式錯誤、不匯入），
+        # 而不是讓它先匯入成功、卻在使用者之後點「編輯」這筆帳目時，被下拉選單
+        # 悄悄改成別的分類、或被清空成「未指定」經手人。
+        valid_categories = self._load_valid_mobile_category_names()
+        valid_handlers = self._load_valid_mobile_handler_names()
 
         entries, errors = [], []
         for idx, row in enumerate(data_rows):
@@ -587,6 +627,10 @@ class Api:
                     raise ValueError(f"日期格式不正確：「{date}」（請使用 YYYY-MM-DD）")
                 if len(category) > 200 or len(note) > 2000 or len(handler) > 100:
                     raise ValueError("文字欄位過長")
+                if valid_categories is not None and category not in valid_categories:
+                    raise ValueError(f"類別「{category}」不在目前分類清單中，請先到「管理中心→帳目分類」新增，或修正試算表內容")
+                if handler and valid_handlers is not None and handler not in valid_handlers:
+                    raise ValueError(f"經手人「{handler}」不在目前經手人清單中，請先到「管理中心→經手人」新增，或修正試算表內容（留空則不會檢查）")
 
                 entries.append({
                     "row_no": row_no, "row_hash": row_hash, "date": date, "type": tx_type, "amount": amount,

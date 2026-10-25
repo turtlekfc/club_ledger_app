@@ -618,11 +618,14 @@ let state = {
             darkMode:false, paperTexture:false, slogan:'', printFooter:'',
             activationEmail:'', activationStrikes:0, activationLocked:false, trialStartedAt:'',
             mobileStaging:{ enabled:false, sheetId:'', sheetName:'表單回應 1', lastBackupTime:'' },
+            openingBalance:{ cash:0, bank:0 },
+            lastLoginAccount:null, // 記住上次成功登入的帳號，格式 {scope:'admin'|'local', id}，登入畫面用來預選帳號；僅記在這本帳本資料裡，不跨帳本
             licenseTier:'T1',
             remoteDiag:{ lastCheckedAt:'', activationCheckEnabled:false, activationEmailUsed:'', statusOk:null, statusFound:null, statusError:'', tierRaw:'', resetRaw:'', resetMatchedAccount:null },
             setup:false, features:{ dualBook:false, budgetDoc:false, advance:false, activationCheck:false }, semesters:[] },
   accounts: [],
   handlers: [],
+  subsidyCases: [], // 補助案清單：{id,name,note,cap,deadline}，全社團共用，供部門/專案預算及支出紀錄的「補助案」下拉選用
   departments: [],
   categories: {
     income:[ {id:uid(),name:'社費/會費',subs:[]}, {id:uid(),name:'活動報名費',subs:[]}, {id:uid(),name:'贊助/捐款',subs:[]},
@@ -720,14 +723,16 @@ function allowedTabIds(){ if(canOpenSettings()) return [...ALL_TAB_IDS,'settings
 
 /* ============ Load & init (with light migration) ============ */
 async function loadAll(){
-  const [config, accounts, handlers, departments, categories, projects, transactions, budgetPlans, oldBudgetPlan, signatures] = await Promise.all([
-    sGet('config', null), sGet('accounts', []), sGet('handlers', null), sGet('departments', []),
+  const [config, accounts, handlers, subsidyCases, departments, categories, projects, transactions, budgetPlans, oldBudgetPlan, signatures] = await Promise.all([
+    sGet('config', null), sGet('accounts', []), sGet('handlers', null), sGet('subsidyCases', []), sGet('departments', []),
     sGet('categories', null), sGet('projects', []), sGet('transactions', []),
     sGet('budgetPlans', null), sGet('budgetPlan', null), sGet('signatures', null)
   ]);
   if(config) state.config = Object.assign(state.config, config, {
     features:Object.assign({dualBook:false,budgetDoc:false,advance:false,activationCheck:false}, config.features||{}),
     mobileStaging:Object.assign({enabled:false,sheetId:'',sheetName:'表單回應 1',lastBackupTime:''}, config.mobileStaging||{}),
+    openingBalance:Object.assign({cash:0,bank:0}, config.openingBalance||{}),
+    lastLoginAccount: config.lastLoginAccount || null,
     licenseTier: config.licenseTier || 'T1',
     remoteDiag: Object.assign({ lastCheckedAt:'', activationCheckEnabled:false, activationEmailUsed:'', statusOk:null, statusFound:null, statusError:'', tierRaw:'', resetRaw:'', resetMatchedAccount:null }, config.remoteDiag||{}),
     fontStyle: config.fontStyle||'serif', fontSize: config.fontSize||'md', radiusStyle: config.radiusStyle||'sharp'
@@ -735,7 +740,11 @@ async function loadAll(){
   state.config.semesters = (state.config.semesters||[]).map(s=>({ shortCode:s.name, ...s }));
   state.accounts = (accounts||[]).map(a=>{
     const preset = ROLE_PRESETS[a.role] || ROLE_PRESETS['其他'];
-    return Object.assign({ allowedTabs: preset.allowedTabs, canReimburse: preset.canReimburse, canViewInternal:true }, a);
+    const merged = Object.assign({ allowedTabs: preset.allowedTabs, canReimburse: preset.canReimburse, canViewInternal:true }, a);
+    // 會計角色固定視為可編輯（見 openAccountModal 的說明）；修正升級前可能存在的
+    // 「會計＋唯讀」舊資料，避免勾選框顯示跟實際行為對不上。
+    if(merged.role==='會計') merged.canEdit = true;
+    return merged;
   });
   if(handlers){ state.handlers = handlers; }
   else {
@@ -743,10 +752,16 @@ async function loadAll(){
     state.handlers = names.map(n=>({ id:uid(), name:n }));
     if(state.handlers.length) await sSet('handlers', state.handlers);
   }
-  state.departments = (departments||[]).map(d=>({ semesterId:null, budget:0, ...d }));
+  state.subsidyCases = subsidyCases||[];
+  // 同專案的邏輯：舊資料沒有補助/自籌拆分時，預設整筆視為「自籌」。
+  state.departments = (departments||[]).map(d=>({ semesterId:null, budget:0, subsidyAmount:0, selfAmount:d.budget||0, ...d }));
   if(categories) state.categories = categories;
-  state.projects = (projects||[]).map(p=>({ semesterId:null, closed: p.status==='已結束', ...p }));
-  state.transactions = (transactions||[]).map(t=> Object.assign({ paymentStatus:'paid', account: (t.method==='現金'?'cash':'bank'), reimbursed:false, reimburseDate:null, reimburseAccount:null, internalOnly:false, invoiceNumber:'', recordedBy:'' }, t));
+  // 舊資料只有單一 budget 欄位，沒有補助/自籌拆分時，預設整筆視為「自籌」
+  // （保守做法：不會無中生有多出一筆補助金額，保持原本預算執行率數字不變）。
+  state.projects = (projects||[]).map(p=>({ semesterId:null, closed: p.status==='已結束', subsidyAmount:0, selfAmount:p.budget||0, ...p }));
+  state.transactions = (transactions||[]).map(t=> Object.assign({ paymentStatus:'paid', account: (t.method==='現金'?'cash':'bank'), reimbursed:false, reimburseDate:null, reimburseAccount:null, internalOnly:false, invoiceNumber:'', recordedBy:'',
+    // 舊資料沒有資金來源欄位時，支出預設視為「自籌」（金額全記為自籌），收入則不適用。
+    fundingSource: t.type==='支出'? '自籌':null, subsidyCaseId:null, fundingSubsidyAmount:0, fundingSelfAmount: t.type==='支出'? (t.amount||0):0 }, t));
   if(budgetPlans) state.budgetPlans = budgetPlans;
   else if(oldBudgetPlan) state.budgetPlans = { '': oldBudgetPlan };
   if(signatures) state.signatures = Object.assign(state.signatures, signatures);
@@ -967,6 +982,10 @@ function renderLock(){
         <input class="input" id="setupAdminUser" placeholder="登入帳號（英數）">
         <input class="input" id="setupAdminPw" type="password" placeholder="密碼（至少 4 碼）">
       `}
+      <div style="display:flex;gap:8px;">
+        <input class="input" id="setupOpeningCash" type="number" min="0" step="1" placeholder="期初現金餘額（選填，預設0）">
+        <input class="input" id="setupOpeningBank" type="number" min="0" step="1" placeholder="期初銀行餘額（選填，預設0）">
+      </div>
       <input class="input" id="setupActivationEmail" type="email" placeholder="帳本啟用信箱（建議填寫，7天內未登記將暫時無法使用）">
       <div class="err" id="setupErr"></div>
       <button class="primary" onclick="doSetup()">建立帳本</button>
@@ -992,9 +1011,14 @@ function renderLock(){
     }
     // 管理員帳號（帳冊共用）排在前面，並標註清楚來源，避免跟這本帳本自己的
     // 會計/社長/指導老師帳號混在一起分不清楚。
+    // 記住「最後一次登入成功的帳號」，下拉選單預設選到它，省去每次重新選擇；
+    // 密碼仍然必須重新輸入，不做自動登入（避免安全性疑慮）。
+    const last = state.config.lastLoginAccount;
+    const lastValue = last? `${last.scope}:${last.id}` : '';
+    const lastExists = last && (last.scope==='admin'? adminAccounts : state.accounts).some(a=>a.id===last.id);
     const accOptions = [
-      ...adminAccounts.map(a=>`<option value="admin:${a.id}">${escapeHtml(a.displayName)}（${escapeHtml(a.role)}・帳冊共用）</option>`),
-      ...state.accounts.map(a=>`<option value="local:${a.id}">${escapeHtml(a.displayName)}（${escapeHtml(a.role)}）</option>`),
+      ...adminAccounts.map(a=>`<option value="admin:${a.id}" ${lastExists&&lastValue==='admin:'+a.id?'selected':''}>${escapeHtml(a.displayName)}（${escapeHtml(a.role)}・帳冊共用）</option>`),
+      ...state.accounts.map(a=>`<option value="local:${a.id}" ${lastExists&&lastValue==='local:'+a.id?'selected':''}>${escapeHtml(a.displayName)}（${escapeHtml(a.role)}）</option>`),
     ].join('');
     card.innerHTML = `
       <div class="logowrap">${state.config.logoDataUrl? `<img src="${state.config.logoDataUrl}">` : '<span class="mark">帳</span>'}</div>
@@ -1007,12 +1031,15 @@ function renderLock(){
       <div class="hint">忘記密碼請洽管理員於「系統設定」重設。新帳號須由管理員於系統設定新增。</div>
       ${inDesktopApp? `<button class="btn small" style="margin-top:10px;" onclick="switchLedger()">← 切換帳本</button>` : ''}
     `;
+    if(lastExists){ const pwEl = document.getElementById('loginPw'); if(pwEl) pwEl.focus(); }
   }
 }
 let setupTheme = THEME_PRESETS[0];
 function pickSetupTheme(c){ setupTheme=c; document.querySelectorAll('#setupSwatches .swatch').forEach(el=> el.classList.toggle('on', el.dataset.c===c)); }
 async function doSetup(){
   const name = document.getElementById('setupName').value.trim() || '社團帳本';
+  const openingCash = Math.max(0, Number(document.getElementById('setupOpeningCash').value) || 0);
+  const openingBank = Math.max(0, Number(document.getElementById('setupOpeningBank').value) || 0);
   const activationEmail = document.getElementById('setupActivationEmail').value.trim();
   const bookHasAdmins = adminAccounts.length>0;
   let newAdmin = null;
@@ -1027,6 +1054,7 @@ async function doSetup(){
   // 如果之後社團端真的需要先離線使用，管理員仍可在系統設定裡勾選開啟
   // (這個方向允許)，但不能反過來關閉已經開啟的管制（見 saveActivationCheckOnly）。
   state.config = Object.assign(state.config, { clubName:name, themeColor:setupTheme, setup:true, activationEmail,
+    openingBalance:{ cash:openingCash, bank:openingBank },
     features: Object.assign({}, state.config.features, { activationCheck:true }) });
   state.accounts = []; // 管理員帳號改存帳冊層級；這本帳本自己的會計/社長/指導老師帳號之後在「帳號與權限」另外新增
   await sSet('config', state.config); await sSet('accounts', state.accounts);
@@ -1060,7 +1088,14 @@ async function doUnlock(){
   currentAccount = acc;
   currentAccountScope = scope;
   if(acc.mustChangePassword){ renderForceChangePassword(); return; }
+  await rememberLastLoginAccount(scope, acc.id);
   unlocked = true; enterApp();
+}
+async function rememberLastLoginAccount(scope, id){
+  // 只記「最後一次登入成功的帳號」用來預選下拉選單，不做自動登入（仍須輸入密碼）。
+  // 存在這本帳本自己的 config 裡，不會影響其他帳本的登入畫面。
+  state.config.lastLoginAccount = { scope, id };
+  try{ await sSet('config', state.config); }catch(e){ /* 記不起來就算了，不影響登入本身 */ }
 }
 function renderForceChangePassword(){
   const card = document.getElementById('lockCard');
@@ -1083,6 +1118,7 @@ async function submitForceChangePassword(){
   currentAccount.passwordHash = await hashPw(pw1);
   delete currentAccount.mustChangePassword;
   await persistAccountScope(currentAccountScope);
+  await rememberLastLoginAccount(currentAccountScope, currentAccount.id);
   unlocked = true; enterApp();
 }
 function lockApp(){
@@ -1231,7 +1267,8 @@ function viewDashboard(){
   const baseTx = hideInternal? state.transactions.filter(t=>isRealized(t) && !t.internalOnly) : state.transactions.filter(isRealizedInternal);
   const income = baseTx.filter(t=>t.type==='收入').reduce((s,t)=>s+t.amount,0);
   const expense = baseTx.filter(t=>t.type==='支出').reduce((s,t)=>s+t.amount,0);
-  const balance = income-expense;
+  const openingTotal = (state.config.openingBalance.cash||0) + (state.config.openingBalance.bank||0);
+  const balance = income-expense+openingTotal;
   const recent = [...state.transactions].sort((a,b)=> b.date.localeCompare(a.date) || b.id.localeCompare(a.id)).slice(0,8);
 
   const pal = getChartPalette();
@@ -1251,7 +1288,7 @@ function viewDashboard(){
   const monthLabels = months.map(m=>m.slice(5)+'月');
 
   const advOn = state.config.features.advance;
-  let cashBal=0, bankBal=0, liability=0, pendingCount=0, drawPending=0, drawPendingCount=0;
+  let cashBal=state.config.openingBalance.cash||0, bankBal=state.config.openingBalance.bank||0, liability=0, pendingCount=0, drawPending=0, drawPendingCount=0;
   if(advOn){
     const realizedTx = state.transactions.filter(t=> t.type==='轉帳' || isRealizedInternal(t));
     realizedTx.forEach(t=>{
@@ -1521,6 +1558,26 @@ function openTxModal(id){
       </div>
     </div>
 
+    <div class="form-section" id="txFundingSection" style="${type==='支出'?'':'display:none'}">
+      <div class="form-section-title">資金來源</div>
+      <div class="form-grid">
+        <div><label>資金來源</label><select class="input" style="width:100%" id="txFundingSource" onchange="toggleFundingFields()">
+          <option value="自籌" ${(!t||!t.fundingSource||t.fundingSource==='自籌')?'selected':''}>自籌</option>
+          <option value="補助" ${t&&t.fundingSource==='補助'?'selected':''}>補助</option>
+          <option value="混合" ${t&&t.fundingSource==='混合'?'selected':''}>混合（補助＋自籌）</option>
+        </select></div>
+        <div id="txSubsidyCaseWrap"><label>補助案</label><select class="input" style="width:100%" id="txSubsidyCase">
+          <option value="">（未指定）</option>
+          ${state.subsidyCases.map(c=>`<option value="${c.id}" ${t&&t.subsidyCaseId===c.id?'selected':''}>${escapeHtml(c.name)}</option>`).join('')}
+        </select></div>
+      </div>
+      <div class="form-grid" id="txMixedAmtWrap">
+        <div><label>補助金額</label><input class="input" style="width:100%" id="txFundSubsidyAmt" type="number" min="0" step="1" value="${t&&t.fundingSubsidyAmount?t.fundingSubsidyAmount:''}"></div>
+        <div><label>自籌金額</label><input class="input" style="width:100%" id="txFundSelfAmt" type="number" min="0" step="1" value="${t&&t.fundingSelfAmount?t.fundingSelfAmount:''}"></div>
+      </div>
+      <p class="desc">選擇「補助」或「混合」時，請選擇對應的補助案；「混合」時補助金額＋自籌金額須等於上方的金額，供報表拆分補助款與自籌款支出。</p>
+    </div>
+
     <div class="form-section">
       <div class="form-section-title">歸屬</div>
       <div class="form-grid">
@@ -1546,6 +1603,7 @@ function openTxModal(id){
   `);
   refreshSubCatOptions(t? t.subCategory : null);
   toggleAdvanceFields();
+  toggleFundingFields();
 }
 function payStatusOptionsHtml(current){
   return `<option value="paid" ${(!current||current==='paid')?'selected':''}>已支出</option>
@@ -1563,7 +1621,20 @@ function refreshPayStatusOptions(){
   }
   toggleAdvanceFields();
 }
-function onTxTypeChange(){ refreshTxCatOptions(); refreshPayStatusOptions(); }
+function onTxTypeChange(){ refreshTxCatOptions(); refreshPayStatusOptions(); toggleFundingSection(); }
+function toggleFundingSection(){
+  const sec = document.getElementById('txFundingSection'); if(!sec) return;
+  const type = document.getElementById('txType').value;
+  sec.style.display = type==='支出'? 'block' : 'none';
+}
+function toggleFundingFields(){
+  toggleFundingSection();
+  const sel = document.getElementById('txFundingSource'); if(!sel) return;
+  const caseWrap = document.getElementById('txSubsidyCaseWrap');
+  const mixedWrap = document.getElementById('txMixedAmtWrap');
+  if(caseWrap) caseWrap.style.display = sel.value==='自籌'? 'none':'block';
+  if(mixedWrap) mixedWrap.style.display = sel.value==='混合'? 'grid':'none';
+}
 function toggleAdvanceFields(){
   const sel = document.getElementById('txPayStatus');
   const methodWrap = document.getElementById('txMethodWrap');
@@ -1596,6 +1667,25 @@ async function saveTx(id){
   const project = state.projects.find(p=>p.id===projectId);
   const advOn = state.config.features.advance;
   let paymentStatus = advOn? document.getElementById('txPayStatus').value : 'paid';
+  // 資金來源（補助/自籌）僅支出適用；收入一律視為自籌（不涉及補助款歸屬）。
+  let fundingSource = '自籌', subsidyCaseId = null, fundingSubsidyAmount = 0, fundingSelfAmount = amount;
+  if(type==='支出'){
+    fundingSource = document.getElementById('txFundingSource').value;
+    if(fundingSource!=='自籌' && fundingSource!=='補助' && fundingSource!=='混合'){ alert('資金來源不正確'); return; }
+    if(fundingSource!=='自籌'){
+      subsidyCaseId = document.getElementById('txSubsidyCase').value || null;
+      if(!subsidyCaseId){ alert('請選擇對應的補助案'); return; }
+    }
+    if(fundingSource==='補助'){ fundingSubsidyAmount = amount; fundingSelfAmount = 0; }
+    else if(fundingSource==='混合'){
+      fundingSubsidyAmount = nonNegativeFiniteNumber(document.getElementById('txFundSubsidyAmt').value || 0);
+      fundingSelfAmount = nonNegativeFiniteNumber(document.getElementById('txFundSelfAmt').value || 0);
+      if(fundingSubsidyAmount===null || fundingSelfAmount===null){ alert('補助金額／自籌金額不正確'); return; }
+      if(Math.round((fundingSubsidyAmount+fundingSelfAmount)*100) !== Math.round(amount*100)){
+        alert(`補助金額＋自籌金額（${fmt(fundingSubsidyAmount+fundingSelfAmount)}）必須等於總金額（${fmt(amount)}）`); return;
+      }
+    } else { fundingSubsidyAmount = 0; fundingSelfAmount = amount; }
+  }
   const data = {
     type, date,
     category: document.getElementById('txCategory').value, subCategory: document.getElementById('txSubCategory').value || '',
@@ -1607,7 +1697,11 @@ async function saveTx(id){
     note: document.getElementById('txNote').value.trim(),
     externalOnly: state.config.features.dualBook? !!document.getElementById('txExternalOnly').checked : false,
     internalOnly: state.config.features.dualBook? !!document.getElementById('txInternalOnly').checked : false,
-    paymentStatus, account: (document.getElementById('txMethod').value==='現金'?'cash':'bank')
+    paymentStatus, account: (document.getElementById('txMethod').value==='現金'?'cash':'bank'),
+    fundingSource: type==='支出'? fundingSource : null,
+    subsidyCaseId: type==='支出'? subsidyCaseId : null,
+    fundingSubsidyAmount: type==='支出'? fundingSubsidyAmount : 0,
+    fundingSelfAmount: type==='支出'? fundingSelfAmount : 0
   };
   if(!id){ data.recordedBy = currentAccount? currentAccount.displayName : ''; }
   if(paymentStatus==='advance' || paymentStatus==='draw'){ data.reimbursed = (id? (state.transactions.find(x=>x.id===id)||{}).reimbursed : false) || false; }
@@ -1639,17 +1733,18 @@ function semSelectorHtml(){
   return `<select class="input" onchange="workingSemId=this.value; currentProjectId=null; renderTab()"><option value="" ${workingSemId===''?'selected':''}>全部學期／未分類</option>${opts}</select>`;
 }
 function viewManage(){
-  const subtabs = [['projects','專案/活動'],['departments','部門/組別'],['categories','帳目分類'],['handlers','經手人']];
+  const subtabs = [['projects','專案/活動'],['departments','部門/組別'],['categories','帳目分類'],['handlers','經手人'],['subsidies','補助案']];
   let body = '';
   if(manageSubTab==='projects') body = manageProjects();
   else if(manageSubTab==='departments') body = manageDepartments();
   else if(manageSubTab==='handlers') body = manageHandlers();
+  else if(manageSubTab==='subsidies') body = manageSubsidyCases();
   else body = manageCategories();
   const needsSem = manageSubTab==='projects' || manageSubTab==='departments';
   return `
     <div class="card">
       <h2 class="serif">管理中心</h2>
-      <p class="desc">專案/活動、部門(組別)依學期分別管理；帳目分類、經手人則為全社團共用</p>
+      <p class="desc">專案/活動、部門(組別)依學期分別管理；帳目分類、經手人、補助案則為全社團共用</p>
       ${needsSem? `<div class="row-actions"><label style="font-size:12px;color:var(--ink-soft)">檢視學期：</label>${semSelectorHtml()}</div>` : ''}
       <div class="subtabs">${subtabs.map(([id,lb])=>`<button class="${manageSubTab===id?'active':''}" onclick="manageSubTab='${id}'; renderTab()">${lb}</button>`).join('')}</div>
       ${body}
@@ -1676,6 +1771,57 @@ async function removeHandler(id){
   if(!confirm('刪除此經手人？已記錄的帳目不會被修改，只是清單中不再列出。')) return;
   state.handlers = state.handlers.filter(h=>h.id!==id);
   await sSet('handlers', state.handlers);
+  renderTab();
+}
+/* -- 補助案（補助/自籌支出追蹤用，全社團共用，不分學期） -- */
+function manageSubsidyCases(){
+  const rows = state.subsidyCases.map(c=>`
+    <div class="cat-row">
+      <div>${escapeHtml(c.name)}
+        ${c.cap? ` <span class="muted" style="font-size:12px">上限 ${fmt(c.cap)}</span>` : ''}
+        ${c.deadline? ` <span class="muted" style="font-size:12px">期限 ${escapeHtml(c.deadline)}</span>` : ''}
+        ${c.note? `<br><span class="muted" style="font-size:12px">${escapeHtml(c.note)}</span>` : ''}
+      </div>
+      ${canEdit()? `<div><button class="btn small" onclick="openSubsidyCaseModal('${c.id}')">編輯</button> <button class="btn small danger" onclick="removeSubsidyCase('${c.id}')">刪除</button></div>` : ''}
+    </div>`).join('');
+  return `
+    <p class="desc">補助案用於「部門/專案預算」拆分補助金額/自籌金額，以及支出記帳時選擇資金來源為「補助」或「混合」時的補助案歸屬，便於核銷與報表彙總。</p>
+    ${canEdit()? `<div class="row-actions"><button class="btn primary" onclick="openSubsidyCaseModal()">+ 新增補助案</button></div>` : ''}
+    ${rows || '<div class="empty">尚未建立任何補助案</div>'}
+  `;
+}
+function openSubsidyCaseModal(id){
+  if(!canEdit()) return;
+  const c = id? state.subsidyCases.find(x=>x.id===id) : null;
+  showModal(`
+    <h3 class="serif">${c? '編輯補助案':'新增補助案'}</h3>
+    <div class="form-grid">
+      <div class="full"><label>補助案名稱</label><input class="input" style="width:100%" id="subCaseName" value="${c?escapeHtml(c.name):''}"></div>
+      <div><label>補助上限（選填）</label><input class="input" style="width:100%" type="number" min="0" step="1" id="subCaseCap" value="${c&&c.cap?c.cap:''}"></div>
+      <div><label>核銷期限（選填）</label><input class="input" style="width:100%" type="date" id="subCaseDeadline" value="${c?escapeHtml(c.deadline||''):''}"></div>
+      <div class="full"><label>備註（選填）</label><input class="input" style="width:100%" id="subCaseNote" value="${c?escapeHtml(c.note||''):''}"></div>
+    </div>
+    <div class="modal-actions"><button class="btn" onclick="closeModal()">取消</button><button class="btn primary" onclick="saveSubsidyCase(${c?`'${c.id}'`:'null'})">儲存</button></div>
+  `);
+}
+async function saveSubsidyCase(id){
+  if(!guard()) return;
+  const name = document.getElementById('subCaseName').value.trim();
+  if(!name){ alert('請輸入補助案名稱'); return; }
+  const cap = Math.max(0, Number(document.getElementById('subCaseCap').value)||0);
+  const deadline = document.getElementById('subCaseDeadline').value;
+  const note = document.getElementById('subCaseNote').value.trim();
+  const data = { name, cap, deadline, note };
+  if(id){ const idx = state.subsidyCases.findIndex(c=>c.id===id); state.subsidyCases[idx] = {...state.subsidyCases[idx], ...data}; }
+  else state.subsidyCases.push({ id: uid(), ...data });
+  await sSet('subsidyCases', state.subsidyCases);
+  closeModal(); renderTab();
+}
+async function removeSubsidyCase(id){
+  if(!guard()) return;
+  if(!confirm('刪除此補助案？已記錄的帳目不會被修改，只是清單中不再列出，報表上仍會顯示原本的補助案名稱。')) return;
+  state.subsidyCases = state.subsidyCases.filter(c=>c.id!==id);
+  await sSet('subsidyCases', state.subsidyCases);
   renderTab();
 }
 function inSemScope(item){ return workingSemId===''? true : (item.semesterId||'')===workingSemId; }
@@ -1746,9 +1892,11 @@ function openProjectModal(id){
       <div><label>部門/組別</label><select class="input" style="width:100%" id="pjDept">${deptOpts}</select></div>
       <div><label>開始日期</label><input class="input" style="width:100%" type="date" id="pjStart" value="${p?p.startDate||'':''}" onchange="suggestProjectSemester()"></div>
       <div><label>結束日期</label><input class="input" style="width:100%" type="date" id="pjEnd" value="${p?p.endDate||'':''}"></div>
-      <div><label>預算（選填）</label><input class="input" style="width:100%" type="number" id="pjBudget" value="${p?p.budget||'':''}"></div>
+      <div><label>補助金額（選填）</label><input class="input" style="width:100%" type="number" min="0" step="1" id="pjSubsidyAmt" value="${p&&p.subsidyAmount?p.subsidyAmount:''}"></div>
+      <div><label>自籌金額（選填）</label><input class="input" style="width:100%" type="number" min="0" step="1" id="pjSelfAmt" value="${p&&p.selfAmount?p.selfAmount:''}"></div>
       <div class="full"><label>備註</label><input class="input" style="width:100%" id="pjNote" value="${p?escapeHtml(p.note||''):''}"></div>
     </div>
+    <p class="desc">預算＝補助金額＋自籌金額，不影響記帳；記帳仍以「入帳金額－花費金額」計算社團實際付出多少。</p>
     <div class="modal-actions"><button class="btn" onclick="closeModal()">取消</button><button class="btn primary" onclick="saveProject(${p?`'${p.id}'`:'null'})">儲存</button></div>
   `);
 }
@@ -1766,13 +1914,15 @@ async function saveProject(id){
   if(startDate && !isValidDateStr(startDate)){ alert('開始日期不正確'); return; }
   if(endDate && !isValidDateStr(endDate)){ alert('結束日期不正確'); return; }
   if(startDate && endDate && startDate>endDate){ alert('結束日期不能早於開始日期'); return; }
-  const budget = nonNegativeFiniteNumber(document.getElementById('pjBudget').value || 0);
-  if(budget===null){ alert('預算金額不正確'); return; }
+  const subsidyAmount = nonNegativeFiniteNumber(document.getElementById('pjSubsidyAmt').value || 0);
+  if(subsidyAmount===null){ alert('補助金額不正確'); return; }
+  const selfAmount = nonNegativeFiniteNumber(document.getElementById('pjSelfAmt').value || 0);
+  if(selfAmount===null){ alert('自籌金額不正確'); return; }
   const data = {
     name, semesterId: document.getElementById('pjSem').value || null,
     type: document.getElementById('pjType').value,
     departmentId: document.getElementById('pjDept').value || null,
-    startDate, endDate, budget, note: document.getElementById('pjNote').value.trim()
+    startDate, endDate, subsidyAmount, selfAmount, budget: subsidyAmount+selfAmount, note: document.getElementById('pjNote').value.trim()
   };
   if(id){ const idx=state.projects.findIndex(p=>p.id===id); state.projects[idx]={...state.projects[idx], ...data}; }
   else state.projects.push({ id: uid(), closed:false, ...data });
@@ -1842,16 +1992,22 @@ function openDeptBudgetModal(id){
   const d = state.departments.find(x=>x.id===id); if(!d) return;
   showModal(`
     <h3 class="serif">設定「${escapeHtml(d.name)}」預算</h3>
-    <div class="form-grid"><div class="full"><label>本學期預算金額</label><input class="input" style="width:100%" type="number" id="dpBudgetOnly" value="${d.budget||''}"></div></div>
+    <div class="form-grid">
+      <div><label>補助金額</label><input class="input" style="width:100%" type="number" min="0" step="1" id="dpSubsidyAmt" value="${d.subsidyAmount||''}"></div>
+      <div><label>自籌金額</label><input class="input" style="width:100%" type="number" min="0" step="1" id="dpSelfAmt" value="${d.selfAmount||''}"></div>
+    </div>
+    <p class="desc">本學期預算＝補助金額＋自籌金額。</p>
     <div class="modal-actions"><button class="btn" onclick="closeModal()">取消</button><button class="btn primary" onclick="saveDeptBudgetOnly('${id}')">儲存</button></div>
   `);
 }
 async function saveDeptBudgetOnly(id){
   if(!guard()) return;
   const d = state.departments.find(x=>x.id===id); if(!d) return;
-  const budget = nonNegativeFiniteNumber(document.getElementById('dpBudgetOnly').value || 0);
-  if(budget===null){ alert('預算金額不正確'); return; }
-  d.budget = budget;
+  const subsidyAmount = nonNegativeFiniteNumber(document.getElementById('dpSubsidyAmt').value || 0);
+  if(subsidyAmount===null){ alert('補助金額不正確'); return; }
+  const selfAmount = nonNegativeFiniteNumber(document.getElementById('dpSelfAmt').value || 0);
+  if(selfAmount===null){ alert('自籌金額不正確'); return; }
+  d.subsidyAmount = subsidyAmount; d.selfAmount = selfAmount; d.budget = subsidyAmount + selfAmount;
   await sSet('departments', state.departments);
   closeModal(); renderTab();
 }
@@ -1982,6 +2138,7 @@ function viewReports(){
           <option value="category" ${reportType==='category'?'selected':''}>分類統計</option>
           <option value="project" ${reportType==='project'?'selected':''}>專案統計</option>
           <option value="department" ${reportType==='department'?'selected':''}>部門統計</option>
+          <option value="subsidy" ${reportType==='subsidy'?'selected':''}>補助案統計</option>
           <option value="charts" ${reportType==='charts'?'selected':''}>統計圖表</option>
           ${state.config.features.advance? `<option value="advance_log" ${reportType==='advance_log'?'selected':''}>資金往來紀錄</option>` : ''}
         </select>
@@ -2027,9 +2184,33 @@ function renderReportBody(){
   if(reportType==='detail') return reportDetail();
   if(reportType==='category') return reportCategory();
   if(reportType==='project') return reportProject();
+  if(reportType==='subsidy') return reportSubsidyCases();
   if(reportType==='charts') return reportCharts();
   if(reportType==='advance_log') return reportAdvanceLog();
   return reportDepartment();
+}
+function reportSubsidyCases(){
+  if(!state.subsidyCases.length) return '<div class="empty">尚未建立任何補助案，請先到「管理中心→補助案」新增。</div>';
+  const list = reportTxList().filter(t=>t.type==='支出' && t.subsidyCaseId);
+  const caseBlocks = state.subsidyCases.map(c=>{
+    const items = list.filter(t=>t.subsidyCaseId===c.id);
+    const subsidySpent = items.reduce((s,t)=>s+(t.fundingSubsidyAmount||0),0);
+    const selfPortion = items.reduce((s,t)=>s+(t.fundingSelfAmount||0),0);
+    return `
+      <h3 class="serif" style="margin-top:18px;">${escapeHtml(c.name)}</h3>
+      <p class="desc">${[c.cap?('補助上限 '+fmt(c.cap)):'', c.deadline?('核銷期限 '+escapeHtml(c.deadline)):'', c.note?escapeHtml(c.note):''].filter(Boolean).join('　') || '（無備註）'}</p>
+      <div class="grid-stats">
+        <div class="stat expense"><div class="lbl">已支用補助款</div><div class="val num">${fmt(subsidySpent)}</div></div>
+        ${c.cap? `<div class="stat"><div class="lbl">核銷進度</div><div class="val num">${Math.round(Math.min(999,subsidySpent/c.cap*100))}%</div></div>`:''}
+        ${selfPortion? `<div class="stat"><div class="lbl">同筆混合支出的自籌部分</div><div class="val num">${fmt(selfPortion)}</div></div>`:''}
+      </div>
+      ${items.length? `<table class="ledger"><thead><tr><th>日期</th><th>分類</th><th>摘要</th><th>資金來源</th><th style="text-align:right">補助部分</th><th style="text-align:right">總金額</th></tr></thead><tbody>
+        ${items.sort((a,b)=>b.date.localeCompare(a.date)).map(t=>`<tr><td class="num">${escapeHtml(t.date)}</td><td>${escapeHtml(t.category)}</td><td>${escapeHtml(t.note||t.counterparty||'')}</td><td>${escapeHtml(t.fundingSource||'')}</td><td style="text-align:right" class="num">${fmt(t.fundingSubsidyAmount||0)}</td><td style="text-align:right" class="num">${fmt(t.amount)}</td></tr>`).join('')}
+      </tbody></table>` : '<div class="empty">此區間尚無此補助案的支出</div>'}
+    `;
+  }).join('');
+  const orphaned = list.filter(t=>!state.subsidyCases.some(c=>c.id===t.subsidyCaseId));
+  return caseBlocks + (orphaned.length? `<p class="desc" style="margin-top:14px;color:var(--rose);">有 ${orphaned.length} 筆支出的補助案已被刪除（原金額仍計入帳目與總支出，只是不會歸入上面任一補助案）。</p>` : '');
 }
 function reportAdvanceLog(){
   const [from,to] = rangeToDates();
@@ -2058,12 +2239,19 @@ function reportDetail(){
   const list = reportTxList().sort((a,b)=>b.date.localeCompare(a.date));
   const income = list.filter(t=>t.type==='收入').reduce((s,t)=>s+t.amount,0);
   const expense = list.filter(t=>t.type==='支出').reduce((s,t)=>s+t.amount,0);
+  const subsidySpent = list.filter(t=>t.type==='支出').reduce((s,t)=>s+(t.fundingSubsidyAmount||0),0);
+  const selfSpent = list.filter(t=>t.type==='支出').reduce((s,t)=>s+(t.fundingSelfAmount||0),0);
   const recorderTh = printIncludeRecorderCol? '<th>記帳人員</th>' : '';
   return `
     <div class="grid-stats">
       <div class="stat income"><div class="lbl">收入合計</div><div class="val num">${fmt(income)}</div></div>
       <div class="stat expense"><div class="lbl">支出合計</div><div class="val num">${fmt(expense)}</div></div>
       <div class="stat"><div class="lbl">結餘</div><div class="val num">${fmt(income-expense)}</div></div>
+    </div>
+    <div class="grid-stats" style="margin-top:8px;">
+      <div class="stat expense"><div class="lbl">總支出</div><div class="val num">${fmt(expense)}</div></div>
+      <div class="stat"><div class="lbl">補助款支出</div><div class="val num">${fmt(subsidySpent)}</div></div>
+      <div class="stat"><div class="lbl">自籌款支出（社團自行負擔）</div><div class="val num">${fmt(selfSpent)}</div></div>
     </div>
     ${list.length? `<table class="ledger"><thead><tr><th>日期</th><th>類型</th><th>分類</th><th>專案</th><th>經手人</th><th>摘要</th><th style="text-align:right">金額</th>${recorderTh}</tr></thead><tbody>
       ${list.map(t=>{const proj=state.projects.find(p=>p.id===t.projectId); const recorderTd=printIncludeRecorderCol? `<td>${escapeHtml(t.recordedBy||'')}</td>`:''; return `<tr><td class="num">${escapeHtml(t.date)}</td><td><span class="tag ${t.type==='支出'?'exp':''}">${escapeHtml(t.type)}</span>${t.externalOnly?' <span class="chip">僅外帳</span>':''}${t.internalOnly?' <span class="chip">僅內帳</span>':''}</td><td>${escapeHtml(t.category)}${t.subCategory?'/'+escapeHtml(t.subCategory):''}</td><td>${proj?escapeHtml(proj.name):'<span class="muted">行政</span>'}</td><td>${escapeHtml(t.handler||'')}</td><td>${escapeHtml(t.note||t.counterparty||'')}</td><td style="text-align:right" class="num ${t.type==='收入'?'amt-in':'amt-out'}">${t.type==='收入'?'+':'-'}${fmt(t.amount)}</td>${recorderTd}</tr>`}).join('')}
@@ -2089,12 +2277,16 @@ function reportProject(){
   const list = reportTxList().filter(t=>t.projectId===p.id);
   const income = list.filter(t=>t.type==='收入').reduce((s,t)=>s+t.amount,0);
   const expense = list.filter(t=>t.type==='支出').reduce((s,t)=>s+t.amount,0);
+  const subsidySpent = list.filter(t=>t.type==='支出').reduce((s,t)=>s+(t.fundingSubsidyAmount||0),0);
+  const selfSpent = list.filter(t=>t.type==='支出').reduce((s,t)=>s+(t.fundingSelfAmount||0),0);
   return `
     <div class="grid-stats">
       <div class="stat income"><div class="lbl">收入</div><div class="val num">${fmt(income)}</div></div>
       <div class="stat expense"><div class="lbl">支出</div><div class="val num">${fmt(expense)}</div></div>
       <div class="stat"><div class="lbl">結餘</div><div class="val num">${fmt(income-expense)}</div></div>
       ${p.budget? `<div class="stat"><div class="lbl">預算執行率</div><div class="val num">${(expense/p.budget*100).toFixed(0)}%</div></div>`:''}
+      ${p.subsidyAmount? `<div class="stat"><div class="lbl">補助執行率</div><div class="val num">${(subsidySpent/p.subsidyAmount*100).toFixed(0)}%</div></div>`:''}
+      ${p.selfAmount? `<div class="stat"><div class="lbl">自籌執行率</div><div class="val num">${(selfSpent/p.selfAmount*100).toFixed(0)}%</div></div>`:''}
     </div>
     <p class="desc">狀態：${p.closed? '<span class="tag">已結案</span>' : '<span class="tag warn">未結案</span>'}</p>
     ${list.length? `<table class="ledger"><thead><tr><th>日期</th><th>類型</th><th>分類</th><th>摘要</th><th style="text-align:right">金額</th></tr></thead><tbody>
@@ -2108,11 +2300,15 @@ function reportDepartment(){
   const list = reportTxList().filter(t=>deptOf(t)===d.id);
   const income = list.filter(t=>t.type==='收入').reduce((s,t)=>s+t.amount,0);
   const expense = list.filter(t=>t.type==='支出').reduce((s,t)=>s+t.amount,0);
+  const subsidySpent = list.filter(t=>t.type==='支出').reduce((s,t)=>s+(t.fundingSubsidyAmount||0),0);
+  const selfSpent = list.filter(t=>t.type==='支出').reduce((s,t)=>s+(t.fundingSelfAmount||0),0);
   return `
     <div class="grid-stats">
       <div class="stat income"><div class="lbl">收入</div><div class="val num">${fmt(income)}</div></div>
       <div class="stat expense"><div class="lbl">支出</div><div class="val num">${fmt(expense)}</div></div>
       ${d.budget? `<div class="stat"><div class="lbl">預算執行率</div><div class="val num">${(expense/d.budget*100).toFixed(0)}%</div></div>`:''}
+      ${d.subsidyAmount? `<div class="stat"><div class="lbl">補助執行率</div><div class="val num">${(subsidySpent/d.subsidyAmount*100).toFixed(0)}%</div></div>`:''}
+      ${d.selfAmount? `<div class="stat"><div class="lbl">自籌執行率</div><div class="val num">${(selfSpent/d.selfAmount*100).toFixed(0)}%</div></div>`:''}
     </div>
     ${list.length? `<table class="ledger"><thead><tr><th>日期</th><th>類型</th><th>分類</th><th>專案</th><th>摘要</th><th style="text-align:right">金額</th></tr></thead><tbody>
       ${list.sort((a,b)=>b.date.localeCompare(a.date)).map(t=>{const proj=state.projects.find(p=>p.id===t.projectId); return `<tr><td class="num">${escapeHtml(t.date)}</td><td><span class="tag ${t.type==='支出'?'exp':''}">${escapeHtml(t.type)}</span></td><td>${escapeHtml(t.category)}</td><td>${proj?escapeHtml(proj.name):''}</td><td>${escapeHtml(t.note||t.counterparty||'')}</td><td style="text-align:right" class="num ${t.type==='收入'?'amt-in':'amt-out'}">${t.type==='收入'?'+':'-'}${fmt(t.amount)}</td></tr>`}).join('')}
@@ -2160,7 +2356,7 @@ function reportCharts(){
   }
   if(chartKind==='cash_bank_pie'){
     const [,to] = rangeToDates();
-    let cashBal=0, bankBal=0;
+    let cashBal=state.config.openingBalance.cash||0, bankBal=state.config.openingBalance.bank||0;
     state.transactions.filter(t=> t.date<=to && (t.type==='轉帳' || isRealizedInternal(t))).forEach(t=>{
       if(t.type==='轉帳'){ if(t.fromAccount==='cash'){cashBal-=t.amount;bankBal+=t.amount;} else {bankBal-=t.amount;cashBal+=t.amount;} return; }
       const acc=txAccount(t); const v=(t.type==='收入'?t.amount:-t.amount); if(acc==='cash') cashBal+=v; else if(acc==='bank') bankBal+=v;
@@ -2193,15 +2389,26 @@ function reportCharts(){
 
 /* ============ Budgets (semester scoped + advanced allocation doc, with save-to-department) ============ */
 function viewBudgets(){
+  const fundingSplitNote = (txList, subsidyAmt, selfAmt)=>{
+    if(!subsidyAmt && !selfAmt) return '';
+    const subsidySpent = txList.reduce((s,t)=>s+(t.fundingSubsidyAmount||0),0);
+    const selfSpent = txList.reduce((s,t)=>s+(t.fundingSelfAmount||0),0);
+    const parts = [];
+    if(subsidyAmt) parts.push(`補助 ${Math.round(Math.min(999,subsidySpent/subsidyAmt*100))}%`);
+    if(selfAmt) parts.push(`自籌 ${Math.round(Math.min(999,selfSpent/selfAmt*100))}%`);
+    return `<div class="muted" style="font-size:11px;margin:-4px 0 6px 0;">執行率拆分：${parts.join('　')}</div>`;
+  };
   const deptRows = state.departments.filter(inSemScope).map(d=>{
-    const expense = state.transactions.filter(t=>t.type==='支出' && isInternalCounted(t) && deptOf(t)===d.id).reduce((s,t)=>s+t.amount,0);
+    const txList = state.transactions.filter(t=>t.type==='支出' && isInternalCounted(t) && deptOf(t)===d.id);
+    const expense = txList.reduce((s,t)=>s+t.amount,0);
     const pct = d.budget>0? Math.min(999,(expense/d.budget*100)) : 0;
-    return `<div class="bar-row"><div class="lbl">${escapeHtml(d.name)}</div><div class="bar-track"><div class="bar-fill ${pct>100?'over':''}" style="width:${Math.min(100,pct)}%"></div></div><div class="bar-val num">${fmt(expense)}${d.budget?' / '+fmt(d.budget):' / 未設定'}</div></div>`;
+    return `<div class="bar-row"><div class="lbl">${escapeHtml(d.name)}</div><div class="bar-track"><div class="bar-fill ${pct>100?'over':''}" style="width:${Math.min(100,pct)}%"></div></div><div class="bar-val num">${fmt(expense)}${d.budget?' / '+fmt(d.budget):' / 未設定'}</div></div>${fundingSplitNote(txList, d.subsidyAmount, d.selfAmount)}`;
   }).join('');
   const projRows = state.projects.filter(inSemScope).filter(p=>p.budget>0).map(p=>{
-    const expense = state.transactions.filter(t=>t.projectId===p.id && t.type==='支出' && isInternalCounted(t)).reduce((s,t)=>s+t.amount,0);
+    const txList = state.transactions.filter(t=>t.projectId===p.id && t.type==='支出' && isInternalCounted(t));
+    const expense = txList.reduce((s,t)=>s+t.amount,0);
     const pct = Math.min(999, expense/p.budget*100);
-    return `<div class="bar-row"><div class="lbl">${escapeHtml(p.name)}</div><div class="bar-track"><div class="bar-fill ${pct>100?'over':''}" style="width:${Math.min(100,pct)}%"></div></div><div class="bar-val num">${fmt(expense)} / ${fmt(p.budget)}</div></div>`;
+    return `<div class="bar-row"><div class="lbl">${escapeHtml(p.name)}</div><div class="bar-track"><div class="bar-fill ${pct>100?'over':''}" style="width:${Math.min(100,pct)}%"></div></div><div class="bar-val num">${fmt(expense)} / ${fmt(p.budget)}</div></div>${fundingSplitNote(txList, p.subsidyAmount, p.selfAmount)}`;
   }).join('');
   return `
     <div class="card">
@@ -2283,9 +2490,17 @@ async function saveAllocationToDepartments(){
   if(!guard()) return;
   const bp = state.budgetPlans[workingSemId];
   const depts = state.departments.filter(inSemScope);
-  depts.forEach(d=>{ const v=bp.allocations[d.id]||0; d.budget = bp.mode==='ratio'? (bp.totalAmount*v/100) : v; });
+  // 這個分配工具不分補助/自籌，分配結果一律整筆記為「自籌」，會直接覆蓋掉部門
+  // 目前的補助/自籌拆分（不會保留、也不會合併）。已經在部門列表手動分過補助/
+  // 自籌金額的部門，存檔前先明確警示一次，讓使用者有機會取消。
+  const willOverwriteSplit = depts.some(d=> (d.subsidyAmount||0) > 0);
+  const warnMsg = willOverwriteSplit
+    ? '⚠️ 偵測到有部門已經在「設定預算」手動分過補助/自籌金額。\n\n此操作會把下方分配金額整個覆蓋成各部門的正式預算，且會把補助/自籌拆分重設為「全部自籌」，原本填的補助金額將會消失。\n\n確定要繼續嗎？'
+    : '此操作會把下方分配金額整個覆蓋成各部門的正式預算（整筆記為自籌）。確定要繼續嗎？';
+  if(!confirm(warnMsg)) return;
+  depts.forEach(d=>{ const v=bp.allocations[d.id]||0; const amt = bp.mode==='ratio'? (bp.totalAmount*v/100) : v; d.selfAmount = amt; d.subsidyAmount = 0; d.budget = amt; });
   await sSet('departments', state.departments);
-  alert('已將分配金額儲存為各部門正式預算');
+  alert('已將分配金額儲存為各部門正式預算（整筆記為自籌，如有補助款請到部門列表「設定預算」調整）');
   renderTab();
 }
 function printBudgetDoc(kind){
@@ -2318,7 +2533,7 @@ function doPrintReport(){
 }
 function exportCSV(){
   const list = reportTxList();
-  const header = ['日期','類型','大分類','小分類','標籤','發票號碼','專案/活動','部門','經手人','記帳人員','付款方式','付款狀態','入帳/歸墊帳戶','對象','摘要','金額','僅外帳','僅內帳'];
+  const header = ['日期','類型','大分類','小分類','標籤','發票號碼','專案/活動','部門','經手人','記帳人員','付款方式','付款狀態','入帳/歸墊帳戶','對象','摘要','金額','僅外帳','僅內帳','資金來源','補助案','補助金額','自籌金額'];
   const lines=[header.join(',')];
   list.forEach(t=>{
     const proj=state.projects.find(p=>p.id===t.projectId); const dept=state.departments.find(d=>d.id===deptOf(t));
@@ -2328,12 +2543,73 @@ function exportCSV(){
     // 可以放換行，但不少簡易 CSV 工具/編輯器不會正確處理，乾脆換成空白，
     // 避免匯出的檔案在別的程式打開時欄位跑位。
     const cleanNote = (t.note||'').replace(/[\r\n]+/g,' ').replace(/,/g,'，');
-    const row=[t.date,t.type,t.category,t.subCategory||'', (t.tags||[]).join('/'), t.invoiceNumber||'', proj?proj.name:'行政/一般', dept?dept.name:'', t.handler||'', t.recordedBy||'', t.method||'', statusLbl, accLbl, t.counterparty||'', cleanNote, t.amount, t.externalOnly?'是':'否', t.internalOnly?'是':'否'];
+    const subsidyCase = t.subsidyCaseId? state.subsidyCases.find(c=>c.id===t.subsidyCaseId) : null;
+    const row=[t.date,t.type,t.category,t.subCategory||'', (t.tags||[]).join('/'), t.invoiceNumber||'', proj?proj.name:'行政/一般', dept?dept.name:'', t.handler||'', t.recordedBy||'', t.method||'', statusLbl, accLbl, t.counterparty||'', cleanNote, t.amount, t.externalOnly?'是':'否', t.internalOnly?'是':'否',
+      t.type==='支出'? (t.fundingSource||'自籌') : '', subsidyCase?subsidyCase.name:'', t.type==='支出'? (t.fundingSubsidyAmount||0):'', t.type==='支出'? (t.fundingSelfAmount||0):''];
     lines.push(row.map(v=>`"${String(v).replace(/"/g,'""')}"`).join(','));
   });
   const blob = new Blob(['\uFEFF'+lines.join('\n')], {type:'text/csv;charset=utf-8;'});
   const url = URL.createObjectURL(blob); const a=document.createElement('a');
   a.href=url; a.download='帳目報表.csv'; a.click(); URL.revokeObjectURL(url);
+}
+// 匯出「目前帳本實際使用中的分類清單」，給使用者對照著去設定手機記帳用的
+// Google 表單選項（下拉式選單/核取方塊），避免手機上填的類別文字跟帳本裡
+// 不一致——不一致不會匯入失敗，但之後編輯該筆帳目時，分類下拉選單會選不到
+// 原本手機填的那個值。純粹是給人看的對照表，不是拿去匯入用的範本。
+// 通用：把一份名稱清單（一行一個）複製到剪貼簿，讓使用者可以直接貼到
+// Google 表單的選項欄（表單選項貼上多行文字會自動依換行拆成多個選項）。
+// clipboard API 在部分桌面 webview 環境可能不可用或被靜默擋下，所以無論
+// 是否呼叫成功，都另外開一個可手動全選複製的文字框當保底，不會讓使用者
+// 卡在「不知道有沒有複製成功」。supplied `names`、`label`（標題用）、
+// `elId`（textarea id，避免兩個清單同時開會互相打架）。
+function copyNameListToClipboard(names, label, elId){
+  if(names.length===0){ alert(`目前還沒有任何${label}，請先到「管理中心」建立。`); return; }
+  const text = names.join('\n');
+  const openFallback = ()=>{
+    showModal(`
+      <h3 class="serif">${label}清單</h3>
+      <p class="desc">共 ${names.length} 個${label}。已嘗試自動複製到剪貼簿；如果貼到表單時是空的，請直接在下方欄位按 Ctrl/Cmd+A 全選、Ctrl/Cmd+C 複製（已預先幫您選取）。</p>
+      <textarea class="input" style="width:100%;height:180px;font-family:monospace;" id="${elId}" readonly>${escapeHtml(text)}</textarea>
+      <div class="row-actions"><button class="btn" onclick="closeModal()">關閉</button></div>
+    `);
+    setTimeout(()=>{
+      const ta = document.getElementById(elId);
+      if(ta){ ta.focus(); ta.select(); }
+    }, 50);
+  };
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(openFallback).catch(openFallback);
+  } else {
+    openFallback();
+  }
+}
+function copyMobileCategoryList(){
+  const names = [];
+  const seen = new Set();
+  ['income','expense'].forEach(kind=>{
+    state.categories[kind].forEach(c=>{ if(!seen.has(c.name)){ seen.add(c.name); names.push(c.name); } });
+  });
+  copyNameListToClipboard(names, '分類', 'catListTextarea');
+}
+function copyMobileHandlerList(){
+  const names = state.handlers.map(h=>h.name);
+  copyNameListToClipboard(names, '經手人', 'handlerListTextarea');
+}
+function exportMobileCategoryTemplate(){
+  const lines = ['收支類型,類別,小分類'];
+  ['income','expense'].forEach(kind=>{
+    const label = kind==='income'? '收入' : '支出';
+    state.categories[kind].forEach(c=>{
+      if(c.subs && c.subs.length){
+        c.subs.forEach(s=> lines.push([label, c.name, s].map(v=>`"${String(v).replace(/"/g,'""')}"`).join(',')));
+      } else {
+        lines.push([label, c.name, ''].map(v=>`"${String(v).replace(/"/g,'""')}"`).join(','));
+      }
+    });
+  });
+  const blob2 = new Blob(['﻿'+lines.join('\n')], {type:'text/csv;charset=utf-8;'});
+  const url2 = URL.createObjectURL(blob2); const a2=document.createElement('a');
+  a2.href=url2; a2.download='手機記帳_目前分類清單.csv'; a2.click(); URL.revokeObjectURL(url2);
 }
 function renderPrintDoc(title, bodyHtml, opts){
   opts = opts||{includeSig:true, includeSeal:false};
@@ -2364,8 +2640,8 @@ function renderPrintDoc(title, bodyHtml, opts){
 /* ============ Settings (basic / semesters / signatures / accounts) ============ */
 function viewSettings(){
   const subtabs = [['basic','基本設定'], ['semesters','學期管理'], ['signatures','簽章與社團章']];
-  if(isAdmin()) subtabs.push(['accounts','帳號與權限']); // 帳號與權限牽涉其他人的登入帳號/角色，僅管理員可見
-  if(settingsSubTab==='accounts' && !isAdmin()) settingsSubTab = 'basic';
+  if(canOpenSettings()) subtabs.push(['accounts','帳號與權限']); // 帳號與權限牽涉其他人的登入帳號/角色，管理員與會計皆可管理（帳冊管理員帳號仍限管理員）
+  if(settingsSubTab==='accounts' && !canOpenSettings()) settingsSubTab = 'basic';
   let body;
   if(settingsSubTab==='basic') body = settingsBasic();
   else if(settingsSubTab==='semesters') body = settingsSemesters();
@@ -2445,6 +2721,19 @@ function settingsBasic(){
       <div class="full"><label>首頁標語/歡迎詞（選填）</label><input class="input" style="width:100%" id="setSlogan" value="${escapeHtml(state.config.slogan)}" placeholder="例：用心記帳，讓社團財務公開透明"></div>
       <div class="full"><label>列印報表頁尾（選填，可多行，例如地址/聯絡方式）</label><textarea class="input" style="width:100%;min-height:60px;" id="setPrintFooter" placeholder="例：114學年度○○社　地址：○○市○○路100號　聯絡電話：0912-345-678">${escapeHtml(state.config.printFooter)}</textarea></div>
     </div>
+    <h3 class="serif" style="margin-top:20px;">期初餘額</h3>
+    <p class="desc">帳本開始使用前，社團手上原本就有的錢（例如交接時留下的結餘）。之後的收支結餘都會以此為起點累加，僅<b>管理員</b>可修改。</p>
+    ${isAdmin()? `
+    <div class="form-grid">
+      <div><label>期初現金</label><input class="input" style="width:100%" type="number" min="0" step="1" id="setOpeningCash" value="${state.config.openingBalance.cash||0}"></div>
+      <div><label>期初銀行</label><input class="input" style="width:100%" type="number" min="0" step="1" id="setOpeningBank" value="${state.config.openingBalance.bank||0}"></div>
+    </div>
+    ` : `
+    <div class="form-grid">
+      <div><label>期初現金</label><div class="input" style="background:var(--paper-line);">${fmt(state.config.openingBalance.cash||0)}</div></div>
+      <div><label>期初銀行</label><div class="input" style="background:var(--paper-line);">${fmt(state.config.openingBalance.bank||0)}</div></div>
+    </div>
+    `}
     <button class="btn primary" onclick="saveBasicSettings()">儲存基本設定</button>
 
     <hr style="margin:20px 0;">
@@ -2507,9 +2796,13 @@ function settingsBasic(){
       <button class="btn primary" onclick="saveMobileStagingSettings()">儲存設定</button>
       <button class="btn" onclick="testMobileStagingConnection()">測試連線</button>
       <button class="btn" onclick="openMobileImportPreview()">📥 匯入手機記錄</button>
+      <button class="btn" onclick="copyMobileCategoryList()">📋 複製分類清單</button>
+      <button class="btn" onclick="copyMobileHandlerList()">📋 複製經手人清單</button>
+      <button class="btn" onclick="exportMobileCategoryTemplate()">匯出 CSV（留存用）</button>
     </div>
     <div id="mobileTestResult"></div>
     <div class="hint" style="margin-top:6px;">最近一次自動備份時間：${state.config.mobileStaging.lastBackupTime? escapeHtml(state.config.mobileStaging.lastBackupTime) : '（尚未匯入過，還沒有自動備份紀錄）'}</div>
+    <div class="hint" style="margin-top:6px;">建議設定 Google 表單的「類別」選項時，先按「📋 複製分類清單」，直接貼到表單的選項欄裡——避免手機填的類別跟帳本裡的不一致（匯入後要編輯該筆帳目時會選不到原本的分類）。</div>
     `}
     ${appVersion? `<div class="muted" style="font-size:11px;margin-top:24px;text-align:right;">軟體版本 v${escapeHtml(appVersion)}</div>` : ''}
   `;
@@ -2596,11 +2889,12 @@ function settingsSignatures(){
   `;
 }
 function settingsAccounts(){
-  if(!isAdmin()) return '<div class="empty">僅管理員可管理帳號</div>';
+  if(!canOpenSettings()) return '<div class="empty">僅管理員／會計可管理帳號</div>';
+  const admin = isAdmin();
   const adminRows = adminAccounts.map(a=>`
     <div class="acc-row">
       <div>${escapeHtml(a.displayName)} <span class="muted" style="font-size:12px">@${escapeHtml(a.username)}</span> <span class="role-badge admin">管理員・帳冊共用</span></div>
-      <div><button class="btn small" onclick="openAdminAccountModal('${a.id}')">編輯</button> <button class="btn small danger" onclick="deleteAdminAccount('${a.id}')">刪除</button></div>
+      ${admin? `<div><button class="btn small" onclick="openAdminAccountModal('${a.id}')">編輯</button> <button class="btn small danger" onclick="deleteAdminAccount('${a.id}')">刪除</button></div>` : ''}
     </div>`).join('') || '<div class="empty">尚未建立任何帳冊共用管理員帳號</div>';
   const legacyAdmins = state.accounts.filter(a=>a.role==='管理員');
   const rows = state.accounts.filter(a=>a.role!=='管理員').map(a=>`
@@ -2610,8 +2904,8 @@ function settingsAccounts(){
     </div>`).join('');
   return `
     <h3 class="serif">帳冊管理員帳號</h3>
-    <p class="desc">橫跨所有帳本登入，可建立多個管理員帳號</p>
-    <div class="row-actions"><button class="btn primary" onclick="openAdminAccountModal()">+ 新增管理員帳號</button></div>
+    <p class="desc">橫跨所有帳本登入，可建立多個管理員帳號${admin? '' : '（僅管理員可新增／編輯／刪除，會計僅能檢視）'}</p>
+    ${admin? `<div class="row-actions"><button class="btn primary" onclick="openAdminAccountModal()">+ 新增管理員帳號</button></div>` : ''}
     ${adminRows}
     ${legacyAdmins.length? `
       <p class="desc" style="margin-top:10px;color:var(--rose);">偵測到這本帳本還留有 ${legacyAdmins.length} 個舊版（升級前）的管理員帳號：${legacyAdmins.map(a=>escapeHtml(a.displayName)).join('、')}。
@@ -2619,7 +2913,7 @@ function settingsAccounts(){
     ` : ''}
     <hr style="margin:20px 0;">
     <h3 class="serif">這本帳本的帳號（會計／社長／指導老師…）</h3>
-    <p class="desc">僅限這本帳本使用，不會橫跨其他帳本</p>
+    <p class="desc">僅限這本帳本使用，不會橫跨其他帳本；管理員與會計皆可新增、編輯、刪除（含指派「會計」角色）</p>
     <div class="row-actions"><button class="btn primary" onclick="openAccountModal()">+ 新增帳號</button></div>
     ${rows}
     <p class="desc" style="margin-top:10px;">選擇角色會自動帶入建議的權限，儲存前可再調整。</p>
@@ -2818,6 +3112,8 @@ async function confirmMobileImport(){
       handler:e.handler||'', counterparty:'', tags:['手機匯入'], invoiceNumber:'',
       note: e.note||'', externalOnly:false, internalOnly:false, paymentStatus:'paid',
       reimbursed:false, reimburseDate:null, reimburseAccount:null,
+      // 手機記帳沒有資金來源欄位，統一視為「自籌」，有補助款的支出請改用電腦版記帳。
+      fundingSource: e.type==='支出'? '自籌':null, subsidyCaseId:null, fundingSubsidyAmount:0, fundingSelfAmount: e.type==='支出'? e.amount:0,
       recordedBy: (currentAccount? currentAccount.displayName : '') + '（手機匯入）'
     });
     importedCount++;
@@ -2861,6 +3157,14 @@ async function saveBasicSettings(){
   }
   state.config.slogan = document.getElementById('setSlogan').value.trim();
   state.config.printFooter = document.getElementById('setPrintFooter').value.trim();
+  // 期初餘額只有管理員改得了（settingsBasic() 非管理員時根本沒畫出可編輯的欄位，
+  // 這裡再擋一次是防呆，避免有人用別的方式呼叫到這個函式）。
+  if(isAdmin()){
+    const cashEl = document.getElementById('setOpeningCash'), bankEl = document.getElementById('setOpeningBank');
+    if(cashEl && bankEl){
+      state.config.openingBalance = { cash: Math.max(0, Number(cashEl.value)||0), bank: Math.max(0, Number(bankEl.value)||0) };
+    }
+  }
   await sSet('config', state.config);
   document.getElementById('clubNameTitle').textContent = state.config.clubName;
   applyTheme(); alert('已儲存'); renderTab();
@@ -3030,7 +3334,7 @@ async function sealSetDefault(val){
 }
 /* -- Accounts (role presets + allowed tabs + reimburse/internal permissions) -- */
 function openAccountModal(id){
-  if(!isAdmin()) return;
+  if(!canOpenSettings()) return;
   const a = id? state.accounts.find(x=>x.id===id) : null;
   // 管理員帳號改成帳冊層級共用（見「帳冊管理員帳號」區塊的 openAdminAccountModal），
   // 這本帳本自己的帳號清單不再提供「管理員」這個角色選項，避免兩邊帳號混在一起、
@@ -3040,15 +3344,23 @@ function openAccountModal(id){
   const roles = Object.keys(ROLE_PRESETS).filter(r=> r!=='管理員' || (a && a.role==='管理員'));
   const allowed = a? (a.allowedTabs||ALL_TAB_IDS) : ROLE_PRESETS['會計'].allowedTabs;
   const tabChecks = ALL_TAB_IDS.map(id2=>`<label><input type="checkbox" class="accTabChk" value="${id2}" ${allowed.includes(id2)?'checked':''}> ${TAB_LABELS[id2]}</label>`).join('');
+  // 會計角色本來就能進「系統設定」管理帳號、改其他人密碼，如果同時把「允許編輯」
+  // 取消勾選想讓這個人變成唯讀，並不會真的限制住他（帳號管理不是看這個勾選框），
+  // 等於是個沒有作用、反而讓人誤以為有限制住的選項，所以會計固定視為可編輯，
+  // 不提供唯讀選項。
+  const defaultRole = a? a.role : roles[0];
+  const isAccountant = defaultRole==='會計';
+  const editChecked = isAccountant? true : (a? !!a.canEdit : ROLE_PRESETS[defaultRole].canEdit);
   showModal(`
     <h3 class="serif">${a? '編輯帳號':'新增帳號'}</h3>
     <div class="form-grid">
       <div><label>姓名</label><input class="input" style="width:100%" id="accName" value="${a?escapeHtml(a.displayName):''}"></div>
       <div><label>登入帳號</label><input class="input" style="width:100%" id="accUser" value="${a?escapeHtml(a.username):''}"></div>
       <div><label>角色</label><select class="input" style="width:100%" id="accRole" onchange="accApplyPreset()">${roles.map(r=>`<option ${a&&a.role===r?'selected':''}>${r}</option>`).join('')}</select></div>
-      <div><label><input type="checkbox" id="accCanEdit" ${a? (a.canEdit?'checked':'') : ''}> 允許編輯帳目/專案/部門</label></div>
+      <div><label><input type="checkbox" id="accCanEdit" ${editChecked?'checked':''} ${isAccountant?'disabled':''}> 允許編輯帳目/專案/部門</label></div>
       ${state.config.features.advance? `<div><label><input type="checkbox" id="accCanReimburse" ${a? (a.canReimburse?'checked':'') : 'checked'}> 允許執行歸墊</label></div>`:''}
       ${state.config.features.dualBook? `<div><label><input type="checkbox" id="accCanViewInternal" ${a? (a.canViewInternal!==false?'checked':'') : 'checked'}> 可檢視內帳（實際金額）</label></div>`:''}
+      <div class="full" id="accCanEditNote" style="${isAccountant?'':'display:none'}"><p class="desc" style="margin:4px 0 0;">會計角色可進「系統設定」管理帳號與系統設定，固定視為可編輯，不提供唯讀選項。</p></div>
       <div class="full"><label>可看到的選單</label><div class="checklist" id="accTabChecks">${tabChecks}</div></div>
       <div class="full"><label>${a?'重設密碼（留空則不變更）':'密碼（至少4碼）'}</label><input class="input" style="width:100%" type="password" id="accPw"></div>
     </div>
@@ -3058,17 +3370,25 @@ function openAccountModal(id){
 function accApplyPreset(){
   const role = document.getElementById('accRole').value;
   const preset = ROLE_PRESETS[role] || ROLE_PRESETS['其他'];
-  document.getElementById('accCanEdit').checked = preset.canEdit;
+  const isAccountant = role==='會計';
+  const editChk = document.getElementById('accCanEdit');
+  editChk.checked = isAccountant? true : preset.canEdit;
+  editChk.disabled = isAccountant;
+  const note = document.getElementById('accCanEditNote');
+  if(note) note.style.display = isAccountant? 'block':'none';
   const rb = document.getElementById('accCanReimburse'); if(rb) rb.checked = preset.canReimburse;
   const vi = document.getElementById('accCanViewInternal'); if(vi) vi.checked = preset.canViewInternal;
   document.querySelectorAll('.accTabChk').forEach(chk=>{ chk.checked = preset.allowedTabs.includes(chk.value); });
 }
 async function saveAccount(id){
-  if(!isAdmin()) return; // 防禦性檢查：這個函式只應該從「帳號與權限」子頁（已限管理員）觸發
+  if(!canOpenSettings()) return; // 防禦性檢查：這個函式只應該從「帳號與權限」子頁（已限管理員／會計）觸發
   const name = document.getElementById('accName').value.trim();
   const user = document.getElementById('accUser').value.trim();
   const role = document.getElementById('accRole').value;
-  const canEditVal = document.getElementById('accCanEdit').checked;
+  // 會計角色固定視為可編輯（見 openAccountModal 的說明），即使前端的 disabled 勾選框
+  // 被繞過送出 false，這裡還是強制改回 true，不讓「會計＋唯讀」這種沒有實際限制
+  // 效果的組合存在。
+  const canEditVal = role==='會計'? true : document.getElementById('accCanEdit').checked;
   const rb = document.getElementById('accCanReimburse'); const canReimburseVal = rb? rb.checked : (role==='管理員'||role==='會計'||role==='出納'||role==='指導老師');
   const vi = document.getElementById('accCanViewInternal'); const canViewInternalVal = vi? vi.checked : true;
   const allowedTabsVal = Array.from(document.querySelectorAll('.accTabChk:checked')).map(c=>c.value);
@@ -3099,7 +3419,7 @@ async function saveAccount(id){
   closeModal(); renderTab();
 }
 async function deleteAccount(id){
-  if(!isAdmin()) return; // 防禦性檢查：這個函式只應該從「帳號與權限」子頁（已限管理員）觸發
+  if(!canOpenSettings()) return; // 防禦性檢查：這個函式只應該從「帳號與權限」子頁（已限管理員／會計）觸發
   const target = state.accounts.find(a=>a.id===id);
   if(!target) return;
   const adminCount = state.accounts.filter(a=>a.role==='管理員').length;
