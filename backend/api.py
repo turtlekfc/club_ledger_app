@@ -14,6 +14,7 @@ import json
 import logging
 import math
 import re
+import ssl
 from datetime import datetime
 from pathlib import Path
 from .db import LedgerDB
@@ -30,6 +31,45 @@ log = logging.getLogger("club_ledger.api")
 # 查版本、給使用者下載連結。
 UPDATE_REPO_OWNER = "turtlekfc"
 UPDATE_REPO_NAME = "club_ledger_app"
+
+
+def _make_ssl_context():
+    """建立連 Google / GitHub 用的 SSL 憑證設定。
+
+    為什麼需要：Windows 版 Python 會直接用系統憑證庫，所以連線正常；但
+    macOS 上打包後的 App 沒有可用的根憑證，urllib 會出現
+    CERTIFICATE_VERIFY_FAILED，導致讀不到啟用試算表（無法啟用）、手機記帳
+    匯入與更新提醒全部失效。這裡依序嘗試：certifi 內建憑證 → 系統預設 →
+    macOS 系統憑證檔（/etc/ssl/cert.pem），哪個可用就用哪個。"""
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        pass
+    ctx = ssl.create_default_context()
+    try:
+        for cafile in ("/etc/ssl/cert.pem", "/private/etc/ssl/cert.pem"):
+            if Path(cafile).exists():
+                ctx.load_verify_locations(cafile=cafile)
+                break
+    except Exception:
+        pass
+    return ctx
+
+
+def _describe_net_error(e: Exception) -> str:
+    """把網路錯誤轉成使用者看得懂的原因，同時保留原始訊息方便排查。"""
+    raw = str(e)
+    reason = getattr(e, "reason", None)
+    if isinstance(reason, ssl.SSLError) or isinstance(e, ssl.SSLError) or "CERTIFICATE_VERIFY_FAILED" in raw:
+        return f"這台電腦無法驗證 Google 的安全憑證（SSL 憑證錯誤）。原始訊息：{raw}"
+    if "timed out" in raw.lower():
+        return f"連線逾時，請檢查網路。原始訊息：{raw}"
+    if "HTTP Error 404" in raw or "HTTP 404" in raw:
+        return f"找不到這份試算表（404），請確認試算表 ID。原始訊息：{raw}"
+    if "HTTP Error 403" in raw or "HTTP 403" in raw:
+        return f"沒有權限讀取試算表（403），請把分享設定改成「知道連結的任何人都可以查看」。原始訊息：{raw}"
+    return f"網路連線失敗：{raw}"
 
 # 目前前端 sGet/sSet 實際用到的 key 都是單純英文小寫（config/accounts/...），
 # 這裡白名單限制格式，純粹是防呆：擋掉奇怪的 key（太長、帶特殊符號）在
@@ -315,7 +355,7 @@ class Api:
     # ---------------------------------------------------------------- #
     def check_email_in_sheet(self, email: str, sheet_id: str, sheet_name: str):
         try:
-            rows = self._fetch_sheet_rows(sheet_id, sheet_name)
+            rows = self._fetch_registry_rows(sheet_id, sheet_name)
         except Exception as e:
             log.warning("check_email_in_sheet failed: %s", e)
             return {"ok": False, "found": False, "error": True, "message": str(e)}
@@ -342,7 +382,7 @@ class Api:
         累加規則見 README「功能分級怎麼用」，實際展開成布林值的邏輯刻意
         放在前端（跟其他業務邏輯一起），這裡只負責讀原始代號，不做判斷。"""
         try:
-            rows = self._fetch_sheet_rows(sheet_id, sheet_name)
+            rows = self._fetch_registry_rows(sheet_id, sheet_name)
         except Exception as e:
             log.warning("check_feature_tier failed: %s", e)
             return {"ok": False, "error": True, "message": str(e)}
@@ -365,7 +405,7 @@ class Api:
         值），由前端自行用本機存的 marker 判斷——這裡只負責讀，不碰任何
         本機或雲端資料。"""
         try:
-            rows = self._fetch_sheet_rows(sheet_id, sheet_name)
+            rows = self._fetch_registry_rows(sheet_id, sheet_name)
         except Exception as e:
             log.warning("check_password_reset_request failed: %s", e)
             return {"ok": False, "error": True, "message": str(e)}
@@ -400,7 +440,7 @@ class Api:
                 "User-Agent": "ClubLedger-UpdateCheck",
                 "Accept": "application/vnd.github+json",
             })
-            with urllib.request.urlopen(req, timeout=8) as resp:
+            with urllib.request.urlopen(req, timeout=8, context=_make_ssl_context()) as resp:
                 if resp.status != 200:
                     raise RuntimeError(f"HTTP {resp.status}")
                 data = json.loads(resp.read().decode("utf-8", errors="replace"))
@@ -460,11 +500,30 @@ class Api:
             f"?tqx=out:csv&sheet={urllib.parse.quote(sheet_name or '帳號')}"
         )
         req = urllib.request.Request(url, headers={"User-Agent": "ClubLedger/1.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            if resp.status != 200:
-                raise RuntimeError(f"HTTP {resp.status}")
-            raw = resp.read().decode("utf-8-sig", errors="replace")
+        try:
+            with urllib.request.urlopen(req, timeout=10, context=_make_ssl_context()) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"HTTP {resp.status}")
+                raw = resp.read().decode("utf-8-sig", errors="replace")
+        except Exception as e:
+            raise RuntimeError(_describe_net_error(e)) from e
+        # 試算表沒開「知道連結的人可查看」時，Google 會回傳登入頁（HTML）而不是
+        # CSV；若不擋下來，會被當成「查無此信箱」而誤顯示成尚未登記。
+        head = raw.lstrip()[:200].lower()
+        if head.startswith("<!doctype html") or head.startswith("<html"):
+            raise RuntimeError("讀到的是網頁而不是資料：試算表可能沒有開放「知道連結的任何人都可以查看」，請檢查分享設定。")
         return list(csv.reader(io.StringIO(raw)))
+
+    @staticmethod
+    def _fetch_registry_rows(sheet_id: str, sheet_name: str):
+        """讀「啟用登記表」，並確認讀到的真的是登記表（A1 應為 Email）。
+        Google 在找不到指定分頁名稱時，會默默改給第一個分頁，欄位就對不上、
+        找不到信箱；這裡明確報錯，避免誤判成「尚未登記」。"""
+        rows = Api._fetch_sheet_rows(sheet_id, sheet_name)
+        a1 = (rows[0][0] if rows and rows[0] else "").strip().lower()
+        if not rows or ("email" not in a1 and "信箱" not in a1 and "mail" not in a1):
+            raise RuntimeError(f"讀到的內容不像啟用登記表（A1 應為 Email）：請確認試算表分頁名稱為「{sheet_name}」，且 A 欄是 Email。")
+        return rows
 
     # ---------------------------------------------------------------- #
     # 手機記帳：簡易雲端暫存 (Option 2, Phase 2 規劃項目)
@@ -531,7 +590,10 @@ class Api:
         return {}
 
     def _load_valid_mobile_category_names(self):
-        """回傳目前帳本「帳目分類」清單裡所有分類名稱（收入+支出合併）。
+        """回傳目前帳本「帳目分類」清單的名稱，依收支類型分開：
+        {"income": {...}, "expense": {...}}。收入的列只能用收入分類、支出的列
+        只能用支出分類，否則匯入後在編輯畫面（下拉選單依類型列出選項）會被
+        悄悄改成別的分類。
         讀不到/格式不對時回傳 None，代表「不檢查」，不要因為這裡解析失敗
         就連帶讓所有手機匯入的類別都被誤判成不合法。"""
         try:
@@ -539,12 +601,11 @@ class Api:
             if not raw:
                 return None
             data = json.loads(raw)
-            names = set()
-            for kind in ("income", "expense"):
-                for c in data.get(kind) or []:
-                    if isinstance(c, dict) and c.get("name"):
-                        names.add(str(c["name"]))
-            return names
+            return {
+                kind: {str(c["name"]) for c in (data.get(kind) or [])
+                       if isinstance(c, dict) and c.get("name")}
+                for kind in ("income", "expense")
+            }
         except Exception:
             log.warning("_load_valid_mobile_category_names failed", exc_info=True)
             return None
@@ -609,7 +670,7 @@ class Api:
                 date = (row[1] if len(row) > 1 else "").strip()
                 type_raw = (row[2] if len(row) > 2 else "").strip()
                 amount_raw = (row[3] if len(row) > 3 else "").strip()
-                category = (row[4] if len(row) > 4 else "").strip() or "未分類"
+                category = (row[4] if len(row) > 4 else "").strip()
                 note = (row[5] if len(row) > 5 else "").strip()
                 handler = (row[6] if len(row) > 6 else "").strip()
 
@@ -627,8 +688,12 @@ class Api:
                     raise ValueError(f"日期格式不正確：「{date}」（請使用 YYYY-MM-DD）")
                 if len(category) > 200 or len(note) > 2000 or len(handler) > 100:
                     raise ValueError("文字欄位過長")
-                if valid_categories is not None and category not in valid_categories:
-                    raise ValueError(f"類別「{category}」不在目前分類清單中，請先到「管理中心→帳目分類」新增，或修正試算表內容")
+                if not category:
+                    raise ValueError("類別不可空白，請在試算表補上類別")
+                if valid_categories is not None:
+                    kind = "income" if tx_type == "收入" else "expense"
+                    if category not in valid_categories[kind]:
+                        raise ValueError(f"{tx_type}類別「{category}」不在目前{tx_type}分類清單中，請先到「管理中心→帳目分類」新增，或修正試算表內容")
                 if handler and valid_handlers is not None and handler not in valid_handlers:
                     raise ValueError(f"經手人「{handler}」不在目前經手人清單中，請先到「管理中心→經手人」新增，或修正試算表內容（留空則不會檢查）")
 

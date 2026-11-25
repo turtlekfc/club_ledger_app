@@ -25,10 +25,12 @@
   "onefile": false,
   "obfuscate": true,
   "data": "auto",
-  "hidden_imports": [],
+  "hidden_imports": [
+    "certifi"
+  ],
   "excludes": [],
   "icon": true,
-  "version": "1.0.0",
+  "version": "1.0.3",
   "bundle_id": "",
   "release_files": "all",
   "release_exclude": [],

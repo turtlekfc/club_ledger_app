@@ -11,7 +11,10 @@ __pycache__/
 *.sqlite3
 # added by build_app.bat
 /dist_obf/
+
+# pytest
+.pytest_cache/
 /venv/
 /.venv/
 /env/
-/venv_損壞備份_26449/
+/venv_損壞備份_30206/

@@ -266,6 +266,31 @@ function nonNegativeFiniteNumber(value){
   return Number.isFinite(n) && n>=0 ? n : null;
 }
 function escapeHtml(s){ return (s==null?'':String(s)).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+/* CSV 欄位輸出：一律用雙引號包起來（逗號、換行都安全），並防止「公式注入」——
+   文字以 = + - @ 開頭（或 Tab/Enter）時，Excel/試算表開啟會當成公式執行，
+   備註、補助案名稱、對象等都是可自由輸入（手機表單匯入的資料更是別人填的），
+   所以在前面補一個單引號讓它變成純文字。數字型別（金額）不處理，避免負數被改壞。 */
+function csvCell(v){
+  if(typeof v==='number') return String(v);
+  let s = v==null? '' : String(v);
+  if(/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+  return `"${s.replace(/"/g,'""')}"`;
+}
+/* 資金來源（補助/自籌）。每筆支出存了 fundingSubsidyAmount／fundingSelfAmount，
+   理論上兩者相加＝amount，但所有「讀取/加總」都統一走 fundingParts()：
+   補助部分夾在 0～amount 之間，自籌＝amount－補助，所以即使日後哪條寫入路徑
+   只改了 amount、忘了同步拆分欄位，報表上「補助＋自籌」也永遠等於總支出，
+   不會悄悄對不上。收入、轉帳不適用，一律回傳 0。 */
+const FUND = { SELF:'自籌', SUBSIDY:'補助', MIXED:'混合' };
+function fundingParts(t){
+  if(!t || t.type!=='支出') return { sub:0, self:0 };
+  const amt = Number(t.amount)||0;
+  const sub = Math.min(amt, Math.max(0, Number(t.fundingSubsidyAmount)||0));
+  return { sub, self: amt - sub };
+}
+function sumFunding(list){
+  return list.reduce((acc,t)=>{ const p=fundingParts(t); acc.sub+=p.sub; acc.self+=p.self; return acc; }, { sub:0, self:0 });
+}
 const MIN_PASSWORD_LENGTH = 4; // 維持現行政策（4碼），不跟著其他建議改成8碼
 function bytesToB64(bytes){
   let s=''; for(const b of bytes) s+=String.fromCharCode(b);
@@ -381,9 +406,14 @@ function recordDiag(partial){
 // 只是重新讀一次 Sheet 上的分級代號、依結果開關功能，不會動到啟用信箱等管理員限定設定）
 async function manualRecheckTier(){
   const beforeTier = state.config.licenseTier || 'T1';
-  await checkFeatureTier();
+  const res = await checkFeatureTier();
   const afterTier = state.config.licenseTier || 'T1';
   renderTab();
+  if(!res.ok){
+    // 沒有真的檢查成功就不能說「已重新檢查」，要如實告知原因，等級沿用上次已知的值
+    alert(`無法確認方案等級，目前仍沿用 ${afterTier}。\n\n原因：${res.reason}`);
+    return;
+  }
   alert(afterTier===beforeTier? `已重新檢查，目前方案等級仍為 ${afterTier}` : `已更新方案等級：${beforeTier} → ${afterTier}`);
 }
 const TRIAL_GRACE_DAYS = 7;
@@ -407,7 +437,7 @@ async function checkActivation(){
     return { blocked:false, trialDaysLeft: Math.max(0, Math.ceil(TRIAL_GRACE_DAYS - days)) };
   }
   const result = await checkEmailInSheet(state.config.activationEmail);
-  recordDiag({ statusOk: !!result.ok, statusFound: !!result.found, statusError: result.error? '連線或讀取失敗（可能是網路問題，或 Sheet ID/分頁名稱填錯）' : '' });
+  recordDiag({ statusOk: !!result.ok, statusFound: !!result.found, statusError: result.error? ('連線或讀取失敗：' + (result.message || '可能是網路問題，或 Sheet ID/分頁名稱填錯')) : '' });
   if(result.error){
     // 連不上網路/讀取失敗，無法判斷是否已登記，不應該因為暫時離線就懲罰使用者，
     // 這次先放行，等下次連得上網路時再正常檢查（不會因此延長或重置試用期）。
@@ -530,15 +560,22 @@ function isFeatureAllowed(name){
   if(!state.config.features.activationCheck) return true; // 沒開啟遠端管制 = 不限制，維持單機使用時的舊行為
   return !!allowedFeatureSet(state.config.licenseTier||'T1')[name];
 }
+// 回傳 { ok:true, tier } 檢查成功；{ ok:false, skipped:true, reason } 沒開管制/沒填信箱所以略過；
+// { ok:false, reason } 連線或讀取失敗（沿用上次已知的等級）。呼叫端可據此如實告知使用者。
 async function checkFeatureTier(){
   if(!state.config.features.activationCheck || !state.config.activationEmail){
-    recordDiag({ tierRaw:'（未啟用帳本啟用管制，不會檢查）' }); await sSet('config', state.config); return;
+    recordDiag({ tierRaw:'（未啟用帳本啟用管制，不會檢查）', tierError:'' }); await sSet('config', state.config);
+    return { ok:false, skipped:true, reason: !state.config.activationEmail? '尚未填寫啟用信箱' : '尚未開啟遠端啟用管制' };
   }
   let tier = '';
   try{
     if(inDesktopApp && window.pywebview && window.pywebview.api.check_feature_tier){
       const r = await window.pywebview.api.check_feature_tier(state.config.activationEmail, DEVELOPER_SHEET_ID, DEVELOPER_SHEET_NAME);
-      if(!r.ok){ recordDiag({ tierRaw:'（連線或讀取失敗，詳見「啟用檢查」的錯誤訊息）' }); await sSet('config', state.config); return; } // 連不到網路就安靜跳過，沿用上次已知的等級，不影響正常登入
+      if(!r.ok){ // 連不到網路就不擋登入，沿用上次已知的等級，但要把原因記下來（設定頁會顯示）
+        const reason = r.message || '連線或讀取失敗（可能是網路問題）';
+        recordDiag({ tierRaw:'（連線或讀取失敗）', tierError: reason }); await sSet('config', state.config);
+        return { ok:false, reason };
+      }
       tier = (r.tier||'').trim().toUpperCase();
     } else {
       const rows = await fetchVerifySheetRows(DEVELOPER_SHEET_ID, DEVELOPER_SHEET_NAME);
@@ -547,8 +584,12 @@ async function checkFeatureTier(){
         if((row[0]||'').trim().toLowerCase()===target){ tier = (row[2]||'').trim().toUpperCase(); break; }
       }
     }
-  }catch(e){ recordDiag({ tierRaw:'（連線時發生例外，可能是網路問題）' }); await sSet('config', state.config); return; }
-  recordDiag({ tierRaw: tier? tier : '（空白，C欄目前沒有填寫分級代號）' });
+  }catch(e){
+    const reason = '連線時發生例外：' + (e && e.message? e.message : e);
+    recordDiag({ tierRaw:'（連線時發生例外，可能是網路問題）', tierError: reason }); await sSet('config', state.config);
+    return { ok:false, reason };
+  }
+  recordDiag({ tierRaw: tier? tier : '（空白，C欄目前沒有填寫分級代號）', tierError:'' });
   if(!FEATURE_TIER_CODES.includes(tier)) tier = 'T1'; // 空白、打錯字都當作最嚴格，不要預設放寬
   let changed = state.config.licenseTier !== tier;
   state.config.licenseTier = tier;
@@ -560,6 +601,7 @@ async function checkFeatureTier(){
   });
   if(!allowed.mobileStaging && state.config.mobileStaging.enabled){ state.config.mobileStaging.enabled = false; changed = true; }
   await sSet('config', state.config); // 不管 changed 與否都存，確保 remoteDiag 的最新讀取結果一定會被保存
+  return { ok:true, tier };
 }
 function shade(hex, percent){
   let f=parseInt(hex.slice(1),16), t=percent<0?0:255, p=Math.abs(percent)/100;
@@ -1068,6 +1110,7 @@ async function doSetup(){
     currentAccountScope = 'admin';
     justCreatedNewBook = true; // 進入 APP 後提醒：要不要幫這本新帳本建立一個會計帳號
   }
+  if(activationEmail){ try{ await checkFeatureTier(); }catch(e){} } // 新帳本填了啟用信箱就立刻查一次等級，不用等下次重開 App
   unlocked = true; enterApp();
 }
 async function doUnlock(){
@@ -1094,6 +1137,10 @@ async function doUnlock(){
 async function rememberLastLoginAccount(scope, id){
   // 只記「最後一次登入成功的帳號」用來預選下拉選單，不做自動登入（仍須輸入密碼）。
   // 存在這本帳本自己的 config 裡，不會影響其他帳本的登入畫面。
+  // 同一個帳號重複登入（最常見情況）不用寫入：config 內含 logo、簽章圖等大型
+  // 資料，每次登入都整包重寫既浪費，兩個視窗同時開時後寫的還可能蓋掉先寫的設定。
+  const prev = state.config.lastLoginAccount;
+  if(prev && prev.scope===scope && prev.id===id) return;
   state.config.lastLoginAccount = { scope, id };
   try{ await sSet('config', state.config); }catch(e){ /* 記不起來就算了，不影響登入本身 */ }
 }
@@ -1569,6 +1616,7 @@ function openTxModal(id){
         <div id="txSubsidyCaseWrap"><label>補助案</label><select class="input" style="width:100%" id="txSubsidyCase">
           <option value="">（未指定）</option>
           ${state.subsidyCases.map(c=>`<option value="${c.id}" ${t&&t.subsidyCaseId===c.id?'selected':''}>${escapeHtml(c.name)}</option>`).join('')}
+          ${t&&t.subsidyCaseId&&!state.subsidyCases.some(c=>c.id===t.subsidyCaseId)? `<option value="${escapeHtml(t.subsidyCaseId)}" selected>（已刪除的補助案）</option>` : ''}
         </select></div>
       </div>
       <div class="form-grid" id="txMixedAmtWrap">
@@ -1632,8 +1680,8 @@ function toggleFundingFields(){
   const sel = document.getElementById('txFundingSource'); if(!sel) return;
   const caseWrap = document.getElementById('txSubsidyCaseWrap');
   const mixedWrap = document.getElementById('txMixedAmtWrap');
-  if(caseWrap) caseWrap.style.display = sel.value==='自籌'? 'none':'block';
-  if(mixedWrap) mixedWrap.style.display = sel.value==='混合'? 'grid':'none';
+  if(caseWrap) caseWrap.style.display = sel.value===FUND.SELF? 'none':'block';
+  if(mixedWrap) mixedWrap.style.display = sel.value===FUND.MIXED? 'grid':'none';
 }
 function toggleAdvanceFields(){
   const sel = document.getElementById('txPayStatus');
@@ -1668,16 +1716,16 @@ async function saveTx(id){
   const advOn = state.config.features.advance;
   let paymentStatus = advOn? document.getElementById('txPayStatus').value : 'paid';
   // 資金來源（補助/自籌）僅支出適用；收入一律視為自籌（不涉及補助款歸屬）。
-  let fundingSource = '自籌', subsidyCaseId = null, fundingSubsidyAmount = 0, fundingSelfAmount = amount;
+  let fundingSource = FUND.SELF, subsidyCaseId = null, fundingSubsidyAmount = 0, fundingSelfAmount = amount;
   if(type==='支出'){
     fundingSource = document.getElementById('txFundingSource').value;
-    if(fundingSource!=='自籌' && fundingSource!=='補助' && fundingSource!=='混合'){ alert('資金來源不正確'); return; }
-    if(fundingSource!=='自籌'){
+    if(!Object.values(FUND).includes(fundingSource)){ alert('資金來源不正確'); return; }
+    if(fundingSource!==FUND.SELF){
       subsidyCaseId = document.getElementById('txSubsidyCase').value || null;
       if(!subsidyCaseId){ alert('請選擇對應的補助案'); return; }
     }
-    if(fundingSource==='補助'){ fundingSubsidyAmount = amount; fundingSelfAmount = 0; }
-    else if(fundingSource==='混合'){
+    if(fundingSource===FUND.SUBSIDY){ fundingSubsidyAmount = amount; fundingSelfAmount = 0; }
+    else if(fundingSource===FUND.MIXED){
       fundingSubsidyAmount = nonNegativeFiniteNumber(document.getElementById('txFundSubsidyAmt').value || 0);
       fundingSelfAmount = nonNegativeFiniteNumber(document.getElementById('txFundSelfAmt').value || 0);
       if(fundingSubsidyAmount===null || fundingSelfAmount===null){ alert('補助金額／自籌金額不正確'); return; }
@@ -1819,7 +1867,11 @@ async function saveSubsidyCase(id){
 }
 async function removeSubsidyCase(id){
   if(!guard()) return;
-  if(!confirm('刪除此補助案？已記錄的帳目不會被修改，只是清單中不再列出，報表上仍會顯示原本的補助案名稱。')) return;
+  const used = state.transactions.filter(t=>t.subsidyCaseId===id).length;
+  const msg = used
+    ? `此補助案已被 ${used} 筆帳目使用。刪除後這些帳目的金額與資金來源都不會改變，但會變成「補助案已刪除」，補助案統計報表只會提示筆數、不會歸入任何補助案。\n\n確定要刪除嗎？`
+    : '刪除此補助案？';
+  if(!confirm(msg)) return;
   state.subsidyCases = state.subsidyCases.filter(c=>c.id!==id);
   await sSet('subsidyCases', state.subsidyCases);
   renderTab();
@@ -2194,8 +2246,7 @@ function reportSubsidyCases(){
   const list = reportTxList().filter(t=>t.type==='支出' && t.subsidyCaseId);
   const caseBlocks = state.subsidyCases.map(c=>{
     const items = list.filter(t=>t.subsidyCaseId===c.id);
-    const subsidySpent = items.reduce((s,t)=>s+(t.fundingSubsidyAmount||0),0);
-    const selfPortion = items.reduce((s,t)=>s+(t.fundingSelfAmount||0),0);
+    const { sub: subsidySpent, self: selfPortion } = sumFunding(items);
     return `
       <h3 class="serif" style="margin-top:18px;">${escapeHtml(c.name)}</h3>
       <p class="desc">${[c.cap?('補助上限 '+fmt(c.cap)):'', c.deadline?('核銷期限 '+escapeHtml(c.deadline)):'', c.note?escapeHtml(c.note):''].filter(Boolean).join('　') || '（無備註）'}</p>
@@ -2205,7 +2256,7 @@ function reportSubsidyCases(){
         ${selfPortion? `<div class="stat"><div class="lbl">同筆混合支出的自籌部分</div><div class="val num">${fmt(selfPortion)}</div></div>`:''}
       </div>
       ${items.length? `<table class="ledger"><thead><tr><th>日期</th><th>分類</th><th>摘要</th><th>資金來源</th><th style="text-align:right">補助部分</th><th style="text-align:right">總金額</th></tr></thead><tbody>
-        ${items.sort((a,b)=>b.date.localeCompare(a.date)).map(t=>`<tr><td class="num">${escapeHtml(t.date)}</td><td>${escapeHtml(t.category)}</td><td>${escapeHtml(t.note||t.counterparty||'')}</td><td>${escapeHtml(t.fundingSource||'')}</td><td style="text-align:right" class="num">${fmt(t.fundingSubsidyAmount||0)}</td><td style="text-align:right" class="num">${fmt(t.amount)}</td></tr>`).join('')}
+        ${items.sort((a,b)=>b.date.localeCompare(a.date)).map(t=>`<tr><td class="num">${escapeHtml(t.date)}</td><td>${escapeHtml(t.category)}</td><td>${escapeHtml(t.note||t.counterparty||'')}</td><td>${escapeHtml(t.fundingSource||'')}</td><td style="text-align:right" class="num">${fmt(fundingParts(t).sub)}</td><td style="text-align:right" class="num">${fmt(t.amount)}</td></tr>`).join('')}
       </tbody></table>` : '<div class="empty">此區間尚無此補助案的支出</div>'}
     `;
   }).join('');
@@ -2239,8 +2290,7 @@ function reportDetail(){
   const list = reportTxList().sort((a,b)=>b.date.localeCompare(a.date));
   const income = list.filter(t=>t.type==='收入').reduce((s,t)=>s+t.amount,0);
   const expense = list.filter(t=>t.type==='支出').reduce((s,t)=>s+t.amount,0);
-  const subsidySpent = list.filter(t=>t.type==='支出').reduce((s,t)=>s+(t.fundingSubsidyAmount||0),0);
-  const selfSpent = list.filter(t=>t.type==='支出').reduce((s,t)=>s+(t.fundingSelfAmount||0),0);
+  const { sub: subsidySpent, self: selfSpent } = sumFunding(list);
   const recorderTh = printIncludeRecorderCol? '<th>記帳人員</th>' : '';
   return `
     <div class="grid-stats">
@@ -2277,8 +2327,7 @@ function reportProject(){
   const list = reportTxList().filter(t=>t.projectId===p.id);
   const income = list.filter(t=>t.type==='收入').reduce((s,t)=>s+t.amount,0);
   const expense = list.filter(t=>t.type==='支出').reduce((s,t)=>s+t.amount,0);
-  const subsidySpent = list.filter(t=>t.type==='支出').reduce((s,t)=>s+(t.fundingSubsidyAmount||0),0);
-  const selfSpent = list.filter(t=>t.type==='支出').reduce((s,t)=>s+(t.fundingSelfAmount||0),0);
+  const { sub: subsidySpent, self: selfSpent } = sumFunding(list);
   return `
     <div class="grid-stats">
       <div class="stat income"><div class="lbl">收入</div><div class="val num">${fmt(income)}</div></div>
@@ -2300,8 +2349,7 @@ function reportDepartment(){
   const list = reportTxList().filter(t=>deptOf(t)===d.id);
   const income = list.filter(t=>t.type==='收入').reduce((s,t)=>s+t.amount,0);
   const expense = list.filter(t=>t.type==='支出').reduce((s,t)=>s+t.amount,0);
-  const subsidySpent = list.filter(t=>t.type==='支出').reduce((s,t)=>s+(t.fundingSubsidyAmount||0),0);
-  const selfSpent = list.filter(t=>t.type==='支出').reduce((s,t)=>s+(t.fundingSelfAmount||0),0);
+  const { sub: subsidySpent, self: selfSpent } = sumFunding(list);
   return `
     <div class="grid-stats">
       <div class="stat income"><div class="lbl">收入</div><div class="val num">${fmt(income)}</div></div>
@@ -2391,8 +2439,7 @@ function reportCharts(){
 function viewBudgets(){
   const fundingSplitNote = (txList, subsidyAmt, selfAmt)=>{
     if(!subsidyAmt && !selfAmt) return '';
-    const subsidySpent = txList.reduce((s,t)=>s+(t.fundingSubsidyAmount||0),0);
-    const selfSpent = txList.reduce((s,t)=>s+(t.fundingSelfAmount||0),0);
+    const { sub: subsidySpent, self: selfSpent } = sumFunding(txList);
     const parts = [];
     if(subsidyAmt) parts.push(`補助 ${Math.round(Math.min(999,subsidySpent/subsidyAmt*100))}%`);
     if(selfAmt) parts.push(`自籌 ${Math.round(Math.min(999,selfSpent/selfAmt*100))}%`);
@@ -2541,12 +2588,13 @@ function exportCSV(){
     const statusLbl = {paid:'已支出/已收入', advance:(t.reimbursed?'幹部墊付-已歸墊':'幹部墊付-待歸還'), draw:(t.reimbursed?'幹部借支-已收回':'幹部借支-待收回'), draw_return:'借支收回款'}[t.paymentStatus] || (t.type==='轉帳'?'現金銀行互轉':'');
     // 備註欄是自由輸入文字，可能含換行——CSV 欄位雖然用雙引號包起來理論上
     // 可以放換行，但不少簡易 CSV 工具/編輯器不會正確處理，乾脆換成空白，
-    // 避免匯出的檔案在別的程式打開時欄位跑位。
-    const cleanNote = (t.note||'').replace(/[\r\n]+/g,' ').replace(/,/g,'，');
+    // 避免匯出的檔案在別的程式打開時欄位跑位。逗號有雙引號保護，不需要改動
+    // 使用者原本的內容。
+    const cleanNote = (t.note||'').replace(/[\r\n]+/g,' ');
     const subsidyCase = t.subsidyCaseId? state.subsidyCases.find(c=>c.id===t.subsidyCaseId) : null;
     const row=[t.date,t.type,t.category,t.subCategory||'', (t.tags||[]).join('/'), t.invoiceNumber||'', proj?proj.name:'行政/一般', dept?dept.name:'', t.handler||'', t.recordedBy||'', t.method||'', statusLbl, accLbl, t.counterparty||'', cleanNote, t.amount, t.externalOnly?'是':'否', t.internalOnly?'是':'否',
-      t.type==='支出'? (t.fundingSource||'自籌') : '', subsidyCase?subsidyCase.name:'', t.type==='支出'? (t.fundingSubsidyAmount||0):'', t.type==='支出'? (t.fundingSelfAmount||0):''];
-    lines.push(row.map(v=>`"${String(v).replace(/"/g,'""')}"`).join(','));
+      t.type==='支出'? (t.fundingSource||FUND.SELF) : '', subsidyCase?subsidyCase.name:'', t.type==='支出'? fundingParts(t).sub:'', t.type==='支出'? fundingParts(t).self:''];
+    lines.push(row.map(csvCell).join(','));
   });
   const blob = new Blob(['\uFEFF'+lines.join('\n')], {type:'text/csv;charset=utf-8;'});
   const url = URL.createObjectURL(blob); const a=document.createElement('a');
@@ -2601,9 +2649,9 @@ function exportMobileCategoryTemplate(){
     const label = kind==='income'? '收入' : '支出';
     state.categories[kind].forEach(c=>{
       if(c.subs && c.subs.length){
-        c.subs.forEach(s=> lines.push([label, c.name, s].map(v=>`"${String(v).replace(/"/g,'""')}"`).join(',')));
+        c.subs.forEach(s=> lines.push([label, c.name, s].map(csvCell).join(',')));
       } else {
-        lines.push([label, c.name, ''].map(v=>`"${String(v).replace(/"/g,'""')}"`).join(','));
+        lines.push([label, c.name, ''].map(csvCell).join(','));
       }
     });
   });
@@ -2664,7 +2712,8 @@ function settingsBasic(){
     <p class="desc" style="margin-bottom:10px;">
       目前功能分級：<b>${escapeHtml(state.config.licenseTier||'T1')}</b>
       <button class="btn small" onclick="manualRecheckTier()">🔄 重新檢查方案等級</button>
-      <span id="tierRecheckResult" style="margin-left:6px;font-size:12px;color:var(--ink-soft);"></span>
+      ${(state.config.remoteDiag && (state.config.remoteDiag.tierError || (state.config.remoteDiag.statusError||'').startsWith('連線或讀取失敗')))
+        ? `<br><span style="font-size:12px;color:var(--rose);">⚠ 上次連線檢查失敗，目前沿用舊的等級：${escapeHtml(state.config.remoteDiag.tierError || state.config.remoteDiag.statusError)}</span>` : ''}
     </p>`;
   return `
     ${tierBadge}
@@ -2985,8 +3034,16 @@ async function doLoadBackup(mode){
 }
 async function saveActivationEmail(){
   if(!canOpenSettings()) return;
+  const oldEmail = state.config.activationEmail || '';
   state.config.activationEmail = document.getElementById('setActivationEmail').value.trim();
   await sSet('config', state.config);
+  if(state.config.activationEmail && state.config.activationEmail !== oldEmail){
+    // 信箱換了，舊信箱對應的等級就不該再沿用，立刻重查
+    const res = await checkFeatureTier();
+    renderTab();
+    alert(res.ok? `已儲存，並重新確認方案等級為 ${state.config.licenseTier||'T1'}` : `已儲存，但無法確認方案等級（目前沿用 ${state.config.licenseTier||'T1'}）。\n\n原因：${res.reason}`);
+    return;
+  }
   alert('已儲存');
   renderTab();
 }
